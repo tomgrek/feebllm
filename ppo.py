@@ -2,6 +2,7 @@
 # given some token and a mask, predict the next token
 
 import torch
+from torch.distributions import Categorical
 import string
 import random
 
@@ -86,14 +87,12 @@ class PPO:
         if self.actor:
             self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=0.1)
             self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=0.1)
-            self.actor_scheduler = torch.optim.lr_scheduler.StepLR(self.actor_optimizer, step_size=1000, gamma=0.1)
-            self.critic_scheduler = torch.optim.lr_scheduler.StepLR(self.critic_optimizer, step_size=1000, gamma=0.1)
+            self.actor_scheduler = torch.optim.lr_scheduler.StepLR(self.actor_optimizer, step_size=1000, gamma=0.3)
+            self.critic_scheduler = torch.optim.lr_scheduler.StepLR(self.critic_optimizer, step_size=1000, gamma=0.3)
         self.gamma = 0.99
         self.eps_clip = 0.5
         self.K_epochs = 4
         self.data = data
-
-        self.cov_mat = torch.eye(len(tokens))
     
     def get_batch(self, bs=8):
         batch = random.sample(self.data, bs)
@@ -123,69 +122,76 @@ class PPO:
                 action_probs = self.actor(seq.squeeze(-1), mask.squeeze(-1)) # (bs, seq_len, n_tokens) aka V
                 old_probs = self.critic(seq.squeeze(-1), mask.squeeze(-1)) # (bs, seq_len, n_tokens)
 
-                # get log probs. First get the first predicted token index, using the mask
-                first_predicted_token = (mask==0).float().argmax(1)  # shape: bs, 1
-                # gather only the 3 tokens starting with first predicted token index
-                pred_mask = torch.arange(0, 3) + first_predicted_token.unsqueeze(-1)
-                # get the log probs for these tokens
-                pred_mask = pred_mask.squeeze(1).unsqueeze(-1)  # shape: bs, 3, 1
-                pred_mask = pred_mask.repeat(1, 1, len(tokens))  # shape: bs, 3, n_tokens
-                action_probs = action_probs.gather(1, pred_mask)
+                dist = Categorical(action_probs)
+                actions = dist.sample()
+                log_probs = dist.log_prob(actions)
 
-                old_probs = old_probs.gather(1, pred_mask)
+                old_dist = Categorical(old_probs)
+                old_log_probs = old_dist.log_prob(actions)
 
-                # Calculate the ratio
-                ratio = torch.exp(action_probs - old_probs) # action_probs / old_probs
+                ratio = torch.exp(log_probs - old_log_probs)
+                clipped_ratio = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip)
 
                 # Calculate the rewards
-                selected_action = action_probs.argmax(-1)
-                dist = torch.distributions.Categorical(action_probs)
-                selected_action = dist.sample()
-                #import ipdb; ipdb.set_trace()
-                # log_probs = dist.log_prob(selected_action)
+                first_predicted_token = (mask==0).float().argmax(1)
                 rewards = []
                 for i in range(target.size(0)): # bs
-                    discount_factor = 1.0#self.gamma
-                    ep_reward = []
-                    for j in range(target.size(1) - 1, -1, -1): # seq_len
-                        ep_reward.insert(0, (target[i, j] == selected_action[i, j]).float().item() * discount_factor)
-                        discount_factor *= self.gamma
+                    # discount_factor = 1.0
+                    start_idx = first_predicted_token[i].item()
+                    ep_reward = [0.] * start_idx
+                    for target_j, j in zip([2, 1, 0], range(start_idx + 2, start_idx - 1, -1)): # seq_len
+                        ep_reward.insert(0, (target[i, target_j] == actions[i, j]).float().item())# * discount_factor)
+                        # discount_factor *= self.gamma
+                    ep_reward += [0.] * (len(actions[0]) - len(ep_reward))
                     rewards.append(ep_reward)
+
                 
                 rewards = torch.tensor(rewards, dtype=torch.float).unsqueeze(-1)
-                #advantage = rewards - action_probs
 
+                returns = []
+                for i in range(rewards.size(0)):
+                    R = 0
+                    discounted_return = []
+                    for r in rewards[i].flip(dims=(0,)):
+                        R = r + self.gamma * R
+                        discounted_return.insert(0, R)
+                    returns.append(discounted_return)
+                returns = torch.tensor(returns, dtype=torch.float).unsqueeze(-1)
 
-                # Calculate the surrogate loss
-                # import ipdb; ipdb.set_trace()
-                # TODO RuntimeError: one of the variables needed for gradient computation has been modified by an inplace operation: [torch.FloatTensor [128, 27]]
-            
-                advantages = rewards.clone() - old_probs.clone().detach()
+                returns = returns.expand_as(old_probs)
+
+                advantages = returns - old_probs.clone().detach()
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                surr1 = ratio * advantages
-                surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-                actor_loss = -torch.min(surr1, surr2).mean()
+
+                # I feel like this is where it goes a bit shady
+                surr1 = ratio.unsqueeze(-1) * advantages
+                surr2 = clipped_ratio.unsqueeze(-1) * advantages
+
+                policy_loss = -torch.min(surr1, surr2).mean()
+                value_loss = torch.nn.MSELoss()(old_probs, returns)
+                import ipdb; ipdb.set_trace()
+                loss = policy_loss + value_loss
+
                 #import ipdb; ipdb.set_trace()
-                
-                critic_loss = torch.nn.MSELoss()(old_probs.clone().gather(-1, pred_mask).mean(dim=-1).unsqueeze(-1), rewards.clone())
-            
-            
+
                 self.actor_optimizer.zero_grad()
-                actor_loss.backward(retain_graph=True)
+                loss.backward(retain_graph=True)
                 self.actor_optimizer.step()
 
-                self.critic_optimizer.zero_grad()
-                critic_loss.backward(retain_graph=True)
-                self.critic_optimizer.step()
-            
+                # Can I just copy the weights every K epochs?
+                # self.critic_optimizer.zero_grad()
+                # loss.backward(retain_graph=True)
+                # self.critic_optimizer.step()
+            if t % 100 == 0:
+                self.critic.load_state_dict(self.actor.state_dict())
             
 
-            print(f"Step {t}, Actor Loss: {actor_loss.item()}, Critic Loss: {critic_loss.item()}")
+            print(f"Step {t}, Loss: {loss.item()}")
 
             
 
 if __name__ == "__main__":
-    examples = generate_data(100, max_seq=10, max_len=7, for_ppo=True)
+    examples = generate_data(2000, max_seq=10, max_len=7, for_ppo=True)
     ppo = PPO(model, examples)
-    ppo.train(examples, timesteps=2000)
+    ppo.train(examples, timesteps=10000)
     ppo.eval()
