@@ -65,13 +65,14 @@ def train(model, data, epochs=20):
         if epoch % 10 == 0:
             print(f"Epoch {epoch}, Loss: {loss.item()}")
 
-#train(model, examples)
+train(model, examples, epochs=2)
 test1 = model(torch.tensor([[10, 1, 2, 3, 4, 5, 6, 7, 8, 9]]), torch.tensor([[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]]))
 print(f"Prediction: {test1.squeeze(0)[1].argmax().item()}") # hope for 10
 test2 = model(torch.tensor([[12, 1, 2, 3, 4, 5, 6, 7, 8, 9]]), torch.tensor([[1, 1, 0, 0, 0, 0, 0, 0, 0, 0]])) # 10 + 1
 print(f"Prediction: {test2.squeeze(0)[2].argmax().item()}") # hope for 13
 test3 = model(torch.tensor([[14, 1, 2, 3, 4, 5, 6, 7, 8, 9]]), torch.tensor([[1, 1, 1, 0, 0, 0, 0, 0, 0, 0]])) # 10 + 1 + 2
 print(f"Prediction: {test3.squeeze(0)[3].argmax().item()}") # hope for 17
+import sys; sys.exit(1)
 
 # Now modify it, the example data should change so that the next token is the sum (still), the next one is that sum + 1 (%26) and again + 1 for the next one
 # Note (and this is NO LONGER true currently as well) the output shape should be larger, ie max seq len needs to reduce by 3 (and by 1 currently)
@@ -106,7 +107,10 @@ class PPO:
         batch = self.get_batch(2)
         output = self.actor(batch[0].squeeze(-1), batch[2].squeeze(-1)).argmax(dim=-1)
         #import ipdb; ipdb.set_trace()
-        print(output, batch[1], batch[2].squeeze())
+        print(output)
+        print(f"Input: {batch[0]}")
+        print(f"Target: {batch[1]}")
+        print(f"Mask: {batch[2].squeeze()}")
 
 
     
@@ -164,34 +168,50 @@ class PPO:
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
                 # I feel like this is where it goes a bit shady
-                surr1 = ratio.unsqueeze(-1) * advantages
-                surr2 = clipped_ratio.unsqueeze(-1) * advantages
+                predicted_mask = (mask == 0).float()
+                # but only for the first 3 tokens starting from the first positive one
+                not_before_this_token = (torch.arange(mask.size(1)).unsqueeze(0) >= first_predicted_token.unsqueeze(-1) - 2).float()
+                not_after_this_token = (torch.arange(mask.size(1)).unsqueeze(0) <= first_predicted_token.unsqueeze(-1) + 2).float()
+
+                not_before_this_token = not_before_this_token.permute(0, -1, 1)
+                not_after_this_token = not_after_this_token.permute(0, -1, 1)
+                mask = predicted_mask * not_before_this_token * not_after_this_token
+                #import ipdb; ipdb.set_trace()
+
+                ratio = ratio.unsqueeze(-1) * mask
+                clipped_ratio = clipped_ratio.unsqueeze(-1) * mask
+
+                surr1 = ratio * advantages
+                surr2 = clipped_ratio * advantages
 
                 policy_loss = -torch.min(surr1, surr2).mean()
-                value_loss = torch.nn.MSELoss()(old_probs, returns)
-                import ipdb; ipdb.set_trace()
-                loss = policy_loss + value_loss
+                value_loss = torch.nn.MSELoss()(old_probs * mask, returns * mask)
+                #value_loss = torch.nn.MSELoss()(old_probs, returns)
+                #loss = policy_loss + value_loss
 
                 #import ipdb; ipdb.set_trace()
 
                 self.actor_optimizer.zero_grad()
-                loss.backward(retain_graph=True)
+                policy_loss.backward(retain_graph=True)
                 self.actor_optimizer.step()
 
-                # Can I just copy the weights every K epochs?
-                # self.critic_optimizer.zero_grad()
-                # loss.backward(retain_graph=True)
-                # self.critic_optimizer.step()
-            if t % 100 == 0:
-                self.critic.load_state_dict(self.actor.state_dict())
-            
+                self.critic_optimizer.zero_grad()
+                value_loss.backward(retain_graph=False)
+                self.critic_optimizer.step()
 
-            print(f"Step {t}, Loss: {loss.item()}")
+                self.actor_scheduler.step()
+                self.critic_scheduler.step()
+            if t % 100 == 0:
+                #self.critic.load_state_dict(self.actor.state_dict())
+                print(f"Step {t}, Policy Loss: {policy_loss.item()} Value Loss: {value_loss.item()}")
+            if abs(policy_loss.item()) < 0.001:
+                print("early stopping")
+                break
 
             
 
 if __name__ == "__main__":
-    examples = generate_data(2000, max_seq=10, max_len=7, for_ppo=True)
+    examples = generate_data(10, max_seq=10, max_len=7, for_ppo=True)
     ppo = PPO(model, examples)
-    ppo.train(examples, timesteps=10000)
+    ppo.train(examples, timesteps=5000)
     ppo.eval()
