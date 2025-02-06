@@ -17,24 +17,24 @@ def generate_data(n_samples, max_len=9, for_ppo=False, max_seq=10):
     for i in range(n_samples):
         seq_len = random.randint(1, max_len)
         seq = [random.randint(0, len(tokens) - 1) for _ in range(seq_len)]
-        mask = [1] * seq_len + [0] * (max_seq - seq_len) + [0]
+        mask = [1] * seq_len + [0] * (max_seq - seq_len)
         # Target should be the sum of the tokens mod 26, for basic model.
         # For PPO, the target should be the sum of the tokens mod 26, the next token should be that sum + 1 mod 26, and the next one should be that sum + 2 mod 26
-        target = sum(seq) % 26
+        target = seq[seq_len-1]#sum(seq) % 26
         if for_ppo:
             target = [target, (target + 1) % 26, (target + 2) % 26]
-        seq += [26] * (max_seq - seq_len) + [26]
+        seq += [26] * (max_seq - seq_len)
         samps.append((seq, target, mask))
     return samps
 
-examples = generate_data(2000, max_len=9, max_seq=10)
+
 
 class Model(torch.nn.Module):
     def __init__(self):
         super(Model, self).__init__()
-        self.embedding = torch.nn.Embedding(len(tokens), 16)
-        self.lstm = torch.nn.LSTM(16, 128, batch_first=True)
-        self.fc = torch.nn.Linear(128, len(tokens))
+        self.embedding = torch.nn.Embedding(len(tokens), 4)#, padding_idx=26) # emb_dim = 4
+        self.lstm = torch.nn.LSTM(4, 64, batch_first=True)
+        self.fc = torch.nn.Linear(64, len(tokens))
         self.softmax = torch.nn.Softmax(dim=2)
 
     def forward(self, x, mask):
@@ -45,10 +45,10 @@ class Model(torch.nn.Module):
         x = self.softmax(x)
         return x
     
-model = Model()
+
 
 def train(model, data, epochs=20):
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
     for epoch in range(epochs):
         for seq, target, mask in data:
             seq = torch.tensor([seq])
@@ -58,20 +58,29 @@ def train(model, data, epochs=20):
             output = output.squeeze(0)
             target = target.view(-1)
             mask = mask.view(-1)
-            loss = torch.nn.functional.cross_entropy(output[mask == 1], target[mask == 1])
+            #import ipdb; ipdb.set_trace()
+            first_valid_hidden_state = (mask == 1).float().argmin().item() - 1
+            loss = torch.nn.functional.cross_entropy(output, target, reduction='none')#output[first_valid_hidden_state], target[0])
+            loss = (loss * mask).sum() / mask.sum()
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-        if epoch % 10 == 0:
+        if epoch % 3 == 0:
             print(f"Epoch {epoch}, Loss: {loss.item()}")
 
-train(model, examples, epochs=2)
+examples = []#generate_data(20, max_len=9, max_seq=10)
+examples.append(([10, 1, 2, 3, 4, 5, 6, 7, 8, 9], [10], [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+examples.append(([12, 1, 2, 3, 4, 5, 6, 7, 8, 9], [1], [1, 1, 0, 0, 0, 0, 0, 0, 0, 0]))
+examples.append(([14, 1, 2, 3, 4, 5, 6, 7, 8, 9], [2], [1, 1, 1, 0, 0, 0, 0, 0, 0, 0]))
+model = Model()
+train(model, examples, epochs=3000)
+
 test1 = model(torch.tensor([[10, 1, 2, 3, 4, 5, 6, 7, 8, 9]]), torch.tensor([[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]]))
 print(f"Prediction: {test1.squeeze(0)[1].argmax().item()}") # hope for 10
 test2 = model(torch.tensor([[12, 1, 2, 3, 4, 5, 6, 7, 8, 9]]), torch.tensor([[1, 1, 0, 0, 0, 0, 0, 0, 0, 0]])) # 10 + 1
-print(f"Prediction: {test2.squeeze(0)[2].argmax().item()}") # hope for 13
+print(f"Prediction: {test2.squeeze(0)[2].argmax().item()}") # hope for 1
 test3 = model(torch.tensor([[14, 1, 2, 3, 4, 5, 6, 7, 8, 9]]), torch.tensor([[1, 1, 1, 0, 0, 0, 0, 0, 0, 0]])) # 10 + 1 + 2
-print(f"Prediction: {test3.squeeze(0)[3].argmax().item()}") # hope for 17
+print(f"Prediction: {test3.squeeze(0)[3].argmax().item()}") # hope for 2
 import sys; sys.exit(1)
 
 # Now modify it, the example data should change so that the next token is the sum (still), the next one is that sum + 1 (%26) and again + 1 for the next one
