@@ -11,28 +11,37 @@ tokens = string.ascii_lowercase + "#" # Add padding token
 print(tokens)
 
 # Context window is 10, for next token prediction we can generate up to 9; for PPO upto 7
-def generate_data(n_samples, max_len=9, for_ppo=False, max_seq=10):
+def generate_data(n_samples, max_len=6, for_ppo=False, total_length=10):
     samps = []
-    max_seq -= 1 # at least one padding token
+    max_seq = total_length - 1 # at least one padding token
     for i in range(n_samples):
         seq_len = random.randint(1, max_len)
-        seq = [random.randint(0, len(tokens) - 1) for _ in range(seq_len)]
-        mask = [1] * seq_len + [0] * (max_seq - seq_len)
+        seq = [random.randint(0, len(tokens) - 2) for _ in range(seq_len)] # 0-25 and hash is 26
+        mask = [1] * seq_len + [0] * (total_length - seq_len)
         # Target should be the sum of the tokens mod 26, for basic model.
         # For PPO, the target should be the sum of the tokens mod 26, the next token should be that sum + 1 mod 26, and the next one should be that sum + 2 mod 26
-        target = seq[seq_len-1]#sum(seq) % 26
+        target = [seq[seq_len-1]]#sum(seq) % 26
         if for_ppo:
             target = [target, (target + 1) % 26, (target + 2) % 26]
-        seq += [26] * (max_seq - seq_len)
+        if len(seq) <= total_length:
+            seq += [tokens.index('#')] * (total_length - seq_len)
+        assert len(seq) == total_length == len(mask)
         samps.append((seq, target, mask))
     return samps
 
+def get_batch(data, bs=8):
+        batch = random.sample(data, bs)
+        seq, target, mask = zip(*batch)
+        batch_seq = torch.tensor([seq]).reshape(bs, len(seq[0]), 1)
+        batch_target = torch.tensor([target]).reshape(bs, len(target[0]), 1)
+        batch_mask = torch.tensor([mask]).reshape(bs, len(mask[0]), 1)
+        return batch_seq, batch_target, batch_mask
 
 
 class Model(torch.nn.Module):
     def __init__(self):
         super(Model, self).__init__()
-        self.embedding = torch.nn.Embedding(len(tokens), 4)#, padding_idx=26) # emb_dim = 4
+        self.embedding = torch.nn.Embedding(len(tokens), 4, padding_idx=26) # emb_dim = 4
         self.lstm = torch.nn.LSTM(4, 64, batch_first=True)
         self.fc = torch.nn.Linear(64, len(tokens))
         self.softmax = torch.nn.Softmax(dim=2)
@@ -42,38 +51,71 @@ class Model(torch.nn.Module):
         x = x * mask.unsqueeze(2)
         x, _ = self.lstm(x)
         x = self.fc(x)
-        x = self.softmax(x)
+        #x = self.softmax(x)
         return x
-    
+
 
 
 def train(model, data, epochs=20):
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
     for epoch in range(epochs):
+        total_loss = 0
+        #datas = [get_batch(data, bs=8) for _ in range(100)]
         for seq, target, mask in data:
             seq = torch.tensor([seq])
-            target = torch.tensor([target] * seq.size(1))
             mask = torch.tensor([mask])
+
             output = model(seq, mask)
             output = output.squeeze(0)
-            target = target.view(-1)
+            
+            target = torch.tensor(target)
             mask = mask.view(-1)
-            #import ipdb; ipdb.set_trace()
-            first_valid_hidden_state = (mask == 1).float().argmin().item() - 1
-            loss = torch.nn.functional.cross_entropy(output, target, reduction='none')#output[first_valid_hidden_state], target[0])
-            loss = (loss * mask).sum() / mask.sum()
+
+            # GOAL:
+            # target: [10] mask: [1, 1, 0, 0, 0, 0, 0, 0, 0, 0] -> [10, 10, 10, 26, 26, 26, 26, 26, 26, 26]
+            padding_value = 26
+            relevant_index = (mask == 1).nonzero(as_tuple=True)[0][-1].item() # gets the last 1 in the mask
+            new_target = torch.full((mask.size(0),), padding_value, dtype=torch.long)
+            new_target[:relevant_index + 1] = target  # sets target values only up to the last 1 in the mask (inclusive)
+            new_target[relevant_index + 1] = target  # first padding token is the actual output we want
+
+            next_token_only_mask = torch.zeros_like(mask)
+            next_token_only_mask[relevant_index + 1] = 1
+
+            target = torch.tensor([target] * seq.size(1))
+            loss = torch.nn.functional.cross_entropy(output, target, reduction='none')
+            loss = (loss * next_token_only_mask).sum() / mask.sum()
+            # This DOES work and seems the FASTEST
+            # target = new_target.view(-1)
+            # relevant_index = (mask == 1).nonzero(as_tuple=True)[0][-1].item() moved it up
+            # loss = torch.nn.functional.cross_entropy(
+            #     output[relevant_index].unsqueeze(0),
+            #     target[relevant_index].unsqueeze(0),
+            #     ignore_index=26
+            # )
+            
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            total_loss += loss.item()
         if epoch % 3 == 0:
             print(f"Epoch {epoch}, Loss: {loss.item()}")
 
-examples = []#generate_data(20, max_len=9, max_seq=10)
-examples.append(([10, 1, 2, 3, 4, 5, 6, 7, 8, 9], [10], [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
-examples.append(([12, 1, 2, 3, 4, 5, 6, 7, 8, 9], [1], [1, 1, 0, 0, 0, 0, 0, 0, 0, 0]))
-examples.append(([14, 1, 2, 3, 4, 5, 6, 7, 8, 9], [2], [1, 1, 1, 0, 0, 0, 0, 0, 0, 0]))
+examples = generate_data(1330, max_len=9, total_length=10)
+# examples.append(([10, 1, 2, 3, 4, 5, 6, 7, 8, 9], [10], [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+# examples.append(([10, 1, 2, 3, 4, 5, 6, 7, 8, 9], [11], [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+# examples.append(([12, 1, 2, 3, 4, 5, 6, 7, 8, 9], [1], [1, 1, 0, 0, 0, 0, 0, 0, 0, 0]))
+# examples.append(([12, 19, 2, 3, 4, 5, 6, 7, 8, 9], [19], [1, 1, 0, 0, 0, 0, 0, 0, 0, 0]))
+# examples.append(([14, 1, 2, 3, 4, 5, 6, 7, 8, 9], [2], [1, 1, 1, 0, 0, 0, 0, 0, 0, 0]))
+# examples.append(([14, 2, 11, 3, 4, 5, 6, 7, 8, 9], [11], [1, 1, 1, 0, 0, 0, 0, 0, 0, 0]))
+# examples.append(([1, 2, 4, 9, 20, 5, 6, 7, 8, 9], [20], [1, 1, 1, 1, 1, 0, 0, 0, 0, 0]))
+#import ipdb; ipdb.set_trace()
+
 model = Model()
-train(model, examples, epochs=3000)
+try:
+    train(model, examples, epochs=1000)
+except KeyboardInterrupt:
+    pass
 
 test1 = model(torch.tensor([[10, 1, 2, 3, 4, 5, 6, 7, 8, 9]]), torch.tensor([[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]]))
 print(f"Prediction: {test1.squeeze(0)[1].argmax().item()}") # hope for 10
@@ -81,6 +123,8 @@ test2 = model(torch.tensor([[12, 1, 2, 3, 4, 5, 6, 7, 8, 9]]), torch.tensor([[1,
 print(f"Prediction: {test2.squeeze(0)[2].argmax().item()}") # hope for 1
 test3 = model(torch.tensor([[14, 1, 2, 3, 4, 5, 6, 7, 8, 9]]), torch.tensor([[1, 1, 1, 0, 0, 0, 0, 0, 0, 0]])) # 10 + 1 + 2
 print(f"Prediction: {test3.squeeze(0)[3].argmax().item()}") # hope for 2
+test4 = model(torch.tensor([[15, 1, 2, 3, 6, 5, 6, 7, 8, 9]]), torch.tensor([[1, 1, 1, 1, 1, 0, 0, 0, 0, 0]])) # 10 + 1 + 2
+print(f"Prediction: {test4.squeeze(0)[3].argmax().item()}") # hope for 6
 import sys; sys.exit(1)
 
 # Now modify it, the example data should change so that the next token is the sum (still), the next one is that sum + 1 (%26) and again + 1 for the next one
