@@ -41,23 +41,32 @@ def get_batch(data, bs=8):
 class Model(torch.nn.Module):
     def __init__(self):
         super(Model, self).__init__()
-        self.embedding = torch.nn.Embedding(len(tokens), 4, padding_idx=26) # emb_dim = 4
-        self.lstm = torch.nn.LSTM(4, 64, batch_first=True)
-        self.fc = torch.nn.Linear(64, len(tokens))
-        self.softmax = torch.nn.Softmax(dim=2)
+        self.embedding = torch.nn.Embedding(len(tokens), 32, padding_idx=26) # emb_dim = 4
+        # self.lstm = torch.nn.LSTM(4, 64, batch_first=True)
+        # self.fc = torch.nn.Linear(64, len(tokens))
+        self.attention = torch.nn.MultiheadAttention(embed_dim=32, num_heads=4, batch_first=True)
+        self.fc = torch.nn.Linear(32, len(tokens))
+        # DONT USE SOFTMAX SINCE CROSS ENTROPY DOES IT
+        # self.softmax = torch.nn.Softmax(dim=2)
 
     def forward(self, x, mask):
         x = self.embedding(x)
-        x = x * mask.unsqueeze(2)
-        x, _ = self.lstm(x)
+
+        new_mask = mask.clone()
+        relevant_index = (new_mask.squeeze(0) == 1).nonzero(as_tuple=True)[0][-1].item()
+        if relevant_index < new_mask.size(1) - 1:
+            new_mask[:, relevant_index + 1] = 1
+
+        x = x * new_mask.unsqueeze(2)
+        # x, _ = self.lstm(x)
+        x, _ = self.attention(x, x, x, key_padding_mask=(new_mask == 0))
         x = self.fc(x)
-        #x = self.softmax(x)
         return x
 
 
 
 def train(model, data, epochs=20):
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
     for epoch in range(epochs):
         total_loss = 0
         #datas = [get_batch(data, bs=8) for _ in range(100)]
@@ -74,6 +83,9 @@ def train(model, data, epochs=20):
             # GOAL:
             # target: [10] mask: [1, 1, 0, 0, 0, 0, 0, 0, 0, 0] -> [10, 10, 10, 26, 26, 26, 26, 26, 26, 26]
             padding_value = 26
+            # for i in range(batch_size): # FOR WHEN I GET TO BATCHES
+            #     relevant_index = (mask[i].squeeze(0) == 1).nonzero(as_tuple=True)[0][-1].item()
+            #     relevant_indices.append(relevant_index)
             relevant_index = (mask == 1).nonzero(as_tuple=True)[0][-1].item() # gets the last 1 in the mask
             new_target = torch.full((mask.size(0),), padding_value, dtype=torch.long)
             new_target[:relevant_index + 1] = target  # sets target values only up to the last 1 in the mask (inclusive)
@@ -101,7 +113,7 @@ def train(model, data, epochs=20):
         if epoch % 3 == 0:
             print(f"Epoch {epoch}, Loss: {loss.item()}")
 
-examples = generate_data(1330, max_len=9, total_length=10)
+examples = generate_data(5000, max_len=9, total_length=10)
 # examples.append(([10, 1, 2, 3, 4, 5, 6, 7, 8, 9], [10], [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
 # examples.append(([10, 1, 2, 3, 4, 5, 6, 7, 8, 9], [11], [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
 # examples.append(([12, 1, 2, 3, 4, 5, 6, 7, 8, 9], [1], [1, 1, 0, 0, 0, 0, 0, 0, 0, 0]))
@@ -117,14 +129,24 @@ try:
 except KeyboardInterrupt:
     pass
 
-test1 = model(torch.tensor([[10, 1, 2, 3, 4, 5, 6, 7, 8, 9]]), torch.tensor([[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]]))
-print(f"Prediction: {test1.squeeze(0)[1].argmax().item()}") # hope for 10
-test2 = model(torch.tensor([[12, 1, 2, 3, 4, 5, 6, 7, 8, 9]]), torch.tensor([[1, 1, 0, 0, 0, 0, 0, 0, 0, 0]])) # 10 + 1
-print(f"Prediction: {test2.squeeze(0)[2].argmax().item()}") # hope for 1
-test3 = model(torch.tensor([[14, 1, 2, 3, 4, 5, 6, 7, 8, 9]]), torch.tensor([[1, 1, 1, 0, 0, 0, 0, 0, 0, 0]])) # 10 + 1 + 2
-print(f"Prediction: {test3.squeeze(0)[3].argmax().item()}") # hope for 2
-test4 = model(torch.tensor([[15, 1, 2, 3, 6, 5, 6, 7, 8, 9]]), torch.tensor([[1, 1, 1, 1, 1, 0, 0, 0, 0, 0]])) # 10 + 1 + 2
-print(f"Prediction: {test4.squeeze(0)[3].argmax().item()}") # hope for 6
+num_eval = 100
+eval_examples = generate_data(num_eval, max_len=9, total_length=10)
+# or like eval_examples.append((torch.tensor([[10, 1, 2, 3, 4, 5, 6, 7, 8, 9]]), torch.tensor([[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]])))
+total_correct = 0
+for seq, target, mask in eval_examples:
+    seq = torch.tensor([seq])
+    mask = torch.tensor([mask])
+    output = model(seq, mask)
+    output = output.squeeze(0)
+    target = torch.tensor([target] * seq.size(1))
+    target = target.view(-1)
+    relevant_index = (mask == 1).nonzero(as_tuple=True)[0][-1].item()
+    prediction = output[relevant_index + 1].argmax().item()
+    correct = prediction == target[relevant_index + 1].item()
+    total_correct += correct
+    print(f"Prediction: {prediction}, Target: {target[relevant_index].item()}")
+print(f"Accuracy: {total_correct / num_eval}")
+
 import sys; sys.exit(1)
 
 # Now modify it, the example data should change so that the next token is the sum (still), the next one is that sum + 1 (%26) and again + 1 for the next one
