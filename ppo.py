@@ -132,7 +132,7 @@ def train(model, data, epochs=20):
         if epoch % 3 == 0:
             print(f"Epoch {epoch}, Loss: {loss.item()}")
 
-examples = generate_data(100, max_len=7, total_length=10, for_ppo=True)
+examples = generate_data(2000, max_len=7, total_length=10, for_ppo=True)
 
 model = Model()
 try:
@@ -141,7 +141,7 @@ except KeyboardInterrupt:
     pass
 
 num_eval = 50
-eval_examples = examples[:num_eval]#generate_data(num_eval, max_len=9, total_length=10)#
+eval_examples = generate_data(num_eval, max_len=7, total_length=10, for_ppo=True)#examples[:num_eval]#
 # or like eval_examples.append((torch.tensor([[10, 1, 2, 3, 4, 5, 6, 7, 8, 9]]), torch.tensor([[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]])))
 total_correct = 0
 for seq, target, mask in eval_examples:
