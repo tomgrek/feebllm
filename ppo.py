@@ -4,6 +4,7 @@
 import torch
 from torch.distributions import Categorical
 import string
+import math
 import random
 
 tokens = string.ascii_lowercase + "#" # Add padding token
@@ -23,7 +24,16 @@ def generate_data(n_samples, max_len=6, for_ppo=False, total_length=10):
         
         if for_ppo:
             last_token = seq[seq_len-1]
-            target = [last_token, last_token, last_token]# (last_token + 1) % 26, (last_token + 2) % 26]
+            if seq_len > 1:
+                second_last_token = seq[seq_len-2]
+            else:
+                second_last_token = 26
+            if seq_len > 2:
+                third_last_token = seq[seq_len-3]
+            else:
+                third_last_token = 26
+            # target = [(last_token+1)%26, (last_token+1)%26, (last_token+1)%26]# THIS WORKS
+            target = [last_token, second_last_token, third_last_token]
         else:
             target = [seq[seq_len-1]]#sum(seq) % 26
         if len(seq) <= total_length:
@@ -40,20 +50,33 @@ def get_batch(data, bs=8):
         batch_mask = torch.tensor([mask]).reshape(bs, len(mask[0]), 1)
         return batch_seq, batch_target, batch_mask
 
+class PositionalEncoding(torch.nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        #pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x.squeeze(2) + self.pe[:x.size(1), :]
 
 class Model(torch.nn.Module):
     def __init__(self):
         super(Model, self).__init__()
-        self.embedding = torch.nn.Embedding(len(tokens), 32, padding_idx=26) # emb_dim = 4
+        self.embedding = torch.nn.Embedding(len(tokens), 32)#, padding_idx=26) # emb_dim = 4
+        self.pos_encoder = PositionalEncoding(32)
         # self.lstm = torch.nn.LSTM(4, 64, batch_first=True)
         # self.fc = torch.nn.Linear(64, len(tokens))
-        self.attention = torch.nn.MultiheadAttention(embed_dim=32, num_heads=32, batch_first=True)
+        self.attention = torch.nn.MultiheadAttention(embed_dim=32, num_heads=2, batch_first=True)
         self.fc = torch.nn.Linear(32, len(tokens))
-        # DONT USE SOFTMAX SINCE CROSS ENTROPY DOES IT
-        # self.softmax = torch.nn.Softmax(dim=2)
 
     def forward(self, x, mask):
         x = self.embedding(x)
+        x = self.pos_encoder(x)
         new_mask = mask.clone()
         batch_size = mask.size(0)
         
@@ -61,8 +84,10 @@ class Model(torch.nn.Module):
             relevant_index = (new_mask[i].squeeze(0) == 1).nonzero(as_tuple=True)[0][-1].item()
             if relevant_index < new_mask.size(1) - 1:
                 new_mask[i, relevant_index + 1] = 1
-
-        x = x * new_mask.unsqueeze(2)
+                new_mask[i, relevant_index + 2] = 1
+                new_mask[i, relevant_index + 3] = 1
+        #import ipdb; ipdb.set_trace()
+        x = x * new_mask#.unsqueeze(2)
         x = x.squeeze(2)
         x, _ = self.attention(x, x, x, key_padding_mask=(new_mask == 0).squeeze(-1))
         x = self.fc(x)
@@ -75,7 +100,7 @@ def train(model, data, epochs=20):
     for epoch in range(epochs):
         datas = [get_batch(data, bs=batch_size) for _ in range(100)]
         for seq, target, mask in datas:
-            output = model(seq, mask)
+            output = model(seq, mask) # both are (bs, seq_len, 1)
             output = output.squeeze(0)
 
             # GOAL:
@@ -98,6 +123,8 @@ def train(model, data, epochs=20):
             loss = torch.nn.functional.cross_entropy(output.permute(0, 2, 1), new_target, reduction='none')
             #import ipdb; ipdb.set_trace()
             loss = (loss * next_tokens_only_mask.squeeze(-1)).sum() / next_tokens_only_mask.sum()
+            if loss < 0.001 and epoch > 50:
+                import ipdb; ipdb.set_trace()
             
             optimizer.zero_grad()
             loss.backward()
@@ -120,7 +147,7 @@ total_correct = 0
 for seq, target, mask in eval_examples:
     seq = torch.tensor([seq])
     mask = torch.tensor([mask])
-    output = model(seq, mask)
+    output = model(seq.unsqueeze(-1), mask.unsqueeze(-1))
     output = output.squeeze(0)
     target = torch.tensor([target] * seq.size(1))
     target = target.view(-1)
