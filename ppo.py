@@ -20,9 +20,12 @@ def generate_data(n_samples, max_len=6, for_ppo=False, total_length=10):
         mask = [1] * seq_len + [0] * (total_length - seq_len)
         # Target should be the sum of the tokens mod 26, for basic model.
         # For PPO, the target should be the sum of the tokens mod 26, the next token should be that sum + 1 mod 26, and the next one should be that sum + 2 mod 26
-        target = [seq[seq_len-1]]#sum(seq) % 26
+        
         if for_ppo:
-            target = [target, (target + 1) % 26, (target + 2) % 26]
+            last_token = seq[seq_len-1]
+            target = [last_token, last_token, last_token]# (last_token + 1) % 26, (last_token + 2) % 26]
+        else:
+            target = [seq[seq_len-1]]#sum(seq) % 26
         if len(seq) <= total_length:
             seq += [tokens.index('#')] * (total_length - seq_len)
         assert len(seq) == total_length == len(mask)
@@ -44,84 +47,65 @@ class Model(torch.nn.Module):
         self.embedding = torch.nn.Embedding(len(tokens), 32, padding_idx=26) # emb_dim = 4
         # self.lstm = torch.nn.LSTM(4, 64, batch_first=True)
         # self.fc = torch.nn.Linear(64, len(tokens))
-        self.attention = torch.nn.MultiheadAttention(embed_dim=32, num_heads=4, batch_first=True)
+        self.attention = torch.nn.MultiheadAttention(embed_dim=32, num_heads=32, batch_first=True)
         self.fc = torch.nn.Linear(32, len(tokens))
         # DONT USE SOFTMAX SINCE CROSS ENTROPY DOES IT
         # self.softmax = torch.nn.Softmax(dim=2)
 
     def forward(self, x, mask):
         x = self.embedding(x)
-
         new_mask = mask.clone()
-        relevant_index = (new_mask.squeeze(0) == 1).nonzero(as_tuple=True)[0][-1].item()
-        if relevant_index < new_mask.size(1) - 1:
-            new_mask[:, relevant_index + 1] = 1
+        batch_size = mask.size(0)
+        
+        for i in range(batch_size):
+            relevant_index = (new_mask[i].squeeze(0) == 1).nonzero(as_tuple=True)[0][-1].item()
+            if relevant_index < new_mask.size(1) - 1:
+                new_mask[i, relevant_index + 1] = 1
 
         x = x * new_mask.unsqueeze(2)
-        # x, _ = self.lstm(x)
-        x, _ = self.attention(x, x, x, key_padding_mask=(new_mask == 0))
+        x = x.squeeze(2)
+        x, _ = self.attention(x, x, x, key_padding_mask=(new_mask == 0).squeeze(-1))
         x = self.fc(x)
         return x
 
 
-
+batch_size = 16
 def train(model, data, epochs=20):
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
     for epoch in range(epochs):
-        total_loss = 0
-        #datas = [get_batch(data, bs=8) for _ in range(100)]
-        for seq, target, mask in data:
-            seq = torch.tensor([seq])
-            mask = torch.tensor([mask])
-
+        datas = [get_batch(data, bs=batch_size) for _ in range(100)]
+        for seq, target, mask in datas:
             output = model(seq, mask)
             output = output.squeeze(0)
-            
-            target = torch.tensor(target)
-            mask = mask.view(-1)
 
             # GOAL:
             # target: [10] mask: [1, 1, 0, 0, 0, 0, 0, 0, 0, 0] -> [10, 10, 10, 26, 26, 26, 26, 26, 26, 26]
             padding_value = 26
-            # for i in range(batch_size): # FOR WHEN I GET TO BATCHES
-            #     relevant_index = (mask[i].squeeze(0) == 1).nonzero(as_tuple=True)[0][-1].item()
-            #     relevant_indices.append(relevant_index)
-            relevant_index = (mask == 1).nonzero(as_tuple=True)[0][-1].item() # gets the last 1 in the mask
-            new_target = torch.full((mask.size(0),), padding_value, dtype=torch.long)
-            new_target[:relevant_index + 1] = target  # sets target values only up to the last 1 in the mask (inclusive)
-            new_target[relevant_index + 1] = target  # first padding token is the actual output we want
+            seq_length = mask.size(1)
+            new_target = torch.full((batch_size, seq_length), padding_value, dtype=torch.long)
+            next_tokens_only_mask = torch.zeros_like(mask)
 
-            next_token_only_mask = torch.zeros_like(mask)
-            next_token_only_mask[relevant_index + 1] = 1
+            for i in range(batch_size): # FOR WHEN I GET TO BATCHES
+                relevant_index = (mask[i].squeeze(0) == 1).nonzero(as_tuple=True)[0][-1].item()
+                new_target[i, relevant_index + 1] = target[i][0].item()
+                new_target[i, relevant_index + 2] = target[i][1].item() # 3 tokens, for PPO
+                new_target[i, relevant_index + 3] = target[i][2].item()
+                #next_tokens_only_mask[i, relevant_index] = 1
+                next_tokens_only_mask[i, relevant_index + 1] = 1
+                next_tokens_only_mask[i, relevant_index + 2] = 1
+                next_tokens_only_mask[i, relevant_index + 3] = 1
 
-            target = torch.tensor([target] * seq.size(1))
-            loss = torch.nn.functional.cross_entropy(output, target, reduction='none')
-            loss = (loss * next_token_only_mask).sum() / mask.sum()
-            # This DOES work and seems the FASTEST
-            # target = new_target.view(-1)
-            # relevant_index = (mask == 1).nonzero(as_tuple=True)[0][-1].item() moved it up
-            # loss = torch.nn.functional.cross_entropy(
-            #     output[relevant_index].unsqueeze(0),
-            #     target[relevant_index].unsqueeze(0),
-            #     ignore_index=26
-            # )
+            loss = torch.nn.functional.cross_entropy(output.permute(0, 2, 1), new_target, reduction='none')
+            #import ipdb; ipdb.set_trace()
+            loss = (loss * next_tokens_only_mask.squeeze(-1)).sum() / next_tokens_only_mask.sum()
             
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
         if epoch % 3 == 0:
             print(f"Epoch {epoch}, Loss: {loss.item()}")
 
-examples = generate_data(500, max_len=9, total_length=10)
-# examples.append(([10, 1, 2, 3, 4, 5, 6, 7, 8, 9], [10], [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
-# examples.append(([10, 1, 2, 3, 4, 5, 6, 7, 8, 9], [11], [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
-# examples.append(([12, 1, 2, 3, 4, 5, 6, 7, 8, 9], [1], [1, 1, 0, 0, 0, 0, 0, 0, 0, 0]))
-# examples.append(([12, 19, 2, 3, 4, 5, 6, 7, 8, 9], [19], [1, 1, 0, 0, 0, 0, 0, 0, 0, 0]))
-# examples.append(([14, 1, 2, 3, 4, 5, 6, 7, 8, 9], [2], [1, 1, 1, 0, 0, 0, 0, 0, 0, 0]))
-# examples.append(([14, 2, 11, 3, 4, 5, 6, 7, 8, 9], [11], [1, 1, 1, 0, 0, 0, 0, 0, 0, 0]))
-# examples.append(([1, 2, 4, 9, 20, 5, 6, 7, 8, 9], [20], [1, 1, 1, 1, 1, 0, 0, 0, 0, 0]))
-#import ipdb; ipdb.set_trace()
+examples = generate_data(100, max_len=7, total_length=10, for_ppo=True)
 
 model = Model()
 try:
@@ -129,8 +113,8 @@ try:
 except KeyboardInterrupt:
     pass
 
-num_eval = 100
-eval_examples = examples[:num_eval]#generate_data(num_eval, max_len=9, total_length=10)
+num_eval = 50
+eval_examples = examples[:num_eval]#generate_data(num_eval, max_len=9, total_length=10)#
 # or like eval_examples.append((torch.tensor([[10, 1, 2, 3, 4, 5, 6, 7, 8, 9]]), torch.tensor([[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]])))
 total_correct = 0
 for seq, target, mask in eval_examples:
@@ -141,10 +125,14 @@ for seq, target, mask in eval_examples:
     target = torch.tensor([target] * seq.size(1))
     target = target.view(-1)
     relevant_index = (mask == 1).nonzero(as_tuple=True)[0][-1].item()
-    prediction = output[relevant_index + 1].argmax().item()
-    correct = prediction == target[relevant_index + 1].item()
-    total_correct += correct
-    print(f"Prediction: {prediction}, Target: {target[relevant_index].item()}")
+    prediction1 = output[relevant_index + 1].argmax().item()
+    correct = prediction1 == target[relevant_index + 1].item()
+    prediction2 = output[relevant_index + 2].argmax().item()
+    correct += prediction2 == target[relevant_index + 2].item()
+    prediction3 = output[relevant_index + 3].argmax().item()
+    correct += prediction3 == target[relevant_index + 3].item()
+    total_correct += (correct / 3)
+    print(f"Prediction: {prediction1, prediction2, prediction3}, Target: {target[relevant_index].item(), target[relevant_index + 1].item(), target[relevant_index + 2].item()}")
 print(f"Accuracy: {total_correct / num_eval}")
 
 import sys; sys.exit(1)
