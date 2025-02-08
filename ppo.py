@@ -121,10 +121,10 @@ def train(model, data, epochs=20):
                 next_tokens_only_mask[i, relevant_index + 3] = 1
 
             loss = torch.nn.functional.cross_entropy(output.permute(0, 2, 1), new_target, reduction='none')
-            #import ipdb; ipdb.set_trace()
             loss = (loss * next_tokens_only_mask.squeeze(-1)).sum() / next_tokens_only_mask.sum()
-            if loss < 0.001 and epoch > 50:
-                import ipdb; ipdb.set_trace()
+            # if loss < 0.001 and epoch > 50:
+            #     # look at e.g. output[5].argmax(-1) vs new_target[5]
+            #     import ipdb; ipdb.set_trace()
             
             optimizer.zero_grad()
             loss.backward()
@@ -147,19 +147,25 @@ total_correct = 0
 for seq, target, mask in eval_examples:
     seq = torch.tensor([seq])
     mask = torch.tensor([mask])
-    output = model(seq.unsqueeze(-1), mask.unsqueeze(-1))
+    output = model(seq.reshape(1, -1, 1), mask.reshape(1, -1, 1))
     output = output.squeeze(0)
-    target = torch.tensor([target] * seq.size(1))
-    target = target.view(-1)
-    relevant_index = (mask == 1).nonzero(as_tuple=True)[0][-1].item()
+    #import ipdb; ipdb.set_trace()
+    relevant_index = (mask == 1).nonzero(as_tuple=True)[1][-1].item()
+    seq_length = mask.size(1)
+    padding_value = tokens.index('#')
+    new_target = torch.full((seq_length, ), padding_value, dtype=torch.long)
+    new_target[relevant_index + 1] = target[0]
+    new_target[relevant_index + 2] = target[1]
+    new_target[relevant_index + 3] = target[2]
+    
     prediction1 = output[relevant_index + 1].argmax().item()
-    correct = prediction1 == target[relevant_index + 1].item()
+    correct = prediction1 == new_target[relevant_index + 1].item()
     prediction2 = output[relevant_index + 2].argmax().item()
-    correct += prediction2 == target[relevant_index + 2].item()
+    correct += prediction2 == new_target[relevant_index + 2].item()
     prediction3 = output[relevant_index + 3].argmax().item()
-    correct += prediction3 == target[relevant_index + 3].item()
+    correct += prediction3 == new_target[relevant_index + 3].item()
     total_correct += (correct / 3)
-    print(f"Prediction: {prediction1, prediction2, prediction3}, Target: {target[relevant_index].item(), target[relevant_index + 1].item(), target[relevant_index + 2].item()}")
+    print(f"Prediction: {prediction1, prediction2, prediction3}, Target: {new_target[relevant_index+1].item(), new_target[relevant_index + 2].item(), new_target[relevant_index + 3].item()}")
 print(f"Accuracy: {total_correct / num_eval}")
 
 import sys; sys.exit(1)
