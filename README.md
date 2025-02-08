@@ -2,18 +2,19 @@
 
 # Status
 
-LSTM worked.
-Attention works too but seems slower to train.
-Softmax makes LSTM slower to train.
-* Make it work in batches
-* Works with sequence lengths of 3
-
+Attention works, in batches, to predict sequences :)
 
 # TODO
 
-* Make it work with arbitrary sequence lengths (i.e. 3 token outputs)
+* Figure out whether padding_idx=26 in the embedding definition is useful or a hinderance.
+* Clean up. Only generate the tensors (seq, mask, target -- and make it the ACTUAL target !!!) in one place.
+* Add PPO
+* Change PPO to GRPO
 
-It's possible to add one, as long as all 3 targets are the same value. It's no good at learning changing sequences.
+# Learnings
+* No softmax in the last layer if using cross entropy loss
+* Masking is helpful
+* The positional encodings really work and are necessary.
 
 # The original dream
 

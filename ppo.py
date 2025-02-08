@@ -58,7 +58,6 @@ class PositionalEncoding(torch.nn.Module):
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        #pe = pe.unsqueeze(0).transpose(0, 1)
         self.register_buffer('pe', pe)
 
     def forward(self, x):
@@ -67,10 +66,8 @@ class PositionalEncoding(torch.nn.Module):
 class Model(torch.nn.Module):
     def __init__(self):
         super(Model, self).__init__()
-        self.embedding = torch.nn.Embedding(len(tokens), 32)#, padding_idx=26) # emb_dim = 4
+        self.embedding = torch.nn.Embedding(len(tokens), 32, padding_idx=26)
         self.pos_encoder = PositionalEncoding(32)
-        # self.lstm = torch.nn.LSTM(4, 64, batch_first=True)
-        # self.fc = torch.nn.Linear(64, len(tokens))
         self.attention = torch.nn.MultiheadAttention(embed_dim=32, num_heads=2, batch_first=True)
         self.fc = torch.nn.Linear(32, len(tokens))
 
@@ -86,8 +83,7 @@ class Model(torch.nn.Module):
                 new_mask[i, relevant_index + 1] = 1
                 new_mask[i, relevant_index + 2] = 1
                 new_mask[i, relevant_index + 3] = 1
-        #import ipdb; ipdb.set_trace()
-        x = x * new_mask#.unsqueeze(2)
+        x = x * new_mask
         x = x.squeeze(2)
         x, _ = self.attention(x, x, x, key_padding_mask=(new_mask == 0).squeeze(-1))
         x = self.fc(x)
@@ -102,29 +98,22 @@ def train(model, data, epochs=20):
         for seq, target, mask in datas:
             output = model(seq, mask) # both are (bs, seq_len, 1)
             output = output.squeeze(0)
-
-            # GOAL:
-            # target: [10] mask: [1, 1, 0, 0, 0, 0, 0, 0, 0, 0] -> [10, 10, 10, 26, 26, 26, 26, 26, 26, 26]
             padding_value = 26
             seq_length = mask.size(1)
             new_target = torch.full((batch_size, seq_length), padding_value, dtype=torch.long)
             next_tokens_only_mask = torch.zeros_like(mask)
 
-            for i in range(batch_size): # FOR WHEN I GET TO BATCHES
+            for i in range(batch_size):
                 relevant_index = (mask[i].squeeze(0) == 1).nonzero(as_tuple=True)[0][-1].item()
                 new_target[i, relevant_index + 1] = target[i][0].item()
                 new_target[i, relevant_index + 2] = target[i][1].item() # 3 tokens, for PPO
                 new_target[i, relevant_index + 3] = target[i][2].item()
-                #next_tokens_only_mask[i, relevant_index] = 1
                 next_tokens_only_mask[i, relevant_index + 1] = 1
                 next_tokens_only_mask[i, relevant_index + 2] = 1
                 next_tokens_only_mask[i, relevant_index + 3] = 1
 
             loss = torch.nn.functional.cross_entropy(output.permute(0, 2, 1), new_target, reduction='none')
             loss = (loss * next_tokens_only_mask.squeeze(-1)).sum() / next_tokens_only_mask.sum()
-            # if loss < 0.001 and epoch > 50:
-            #     # look at e.g. output[5].argmax(-1) vs new_target[5]
-            #     import ipdb; ipdb.set_trace()
             
             optimizer.zero_grad()
             loss.backward()
@@ -142,14 +131,12 @@ except KeyboardInterrupt:
 
 num_eval = 50
 eval_examples = generate_data(num_eval, max_len=7, total_length=10, for_ppo=True)#examples[:num_eval]#
-# or like eval_examples.append((torch.tensor([[10, 1, 2, 3, 4, 5, 6, 7, 8, 9]]), torch.tensor([[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]])))
 total_correct = 0
 for seq, target, mask in eval_examples:
     seq = torch.tensor([seq])
     mask = torch.tensor([mask])
     output = model(seq.reshape(1, -1, 1), mask.reshape(1, -1, 1))
     output = output.squeeze(0)
-    #import ipdb; ipdb.set_trace()
     relevant_index = (mask == 1).nonzero(as_tuple=True)[1][-1].item()
     seq_length = mask.size(1)
     padding_value = tokens.index('#')
