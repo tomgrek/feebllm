@@ -66,7 +66,7 @@ class PositionalEncoding(torch.nn.Module):
 class Model(torch.nn.Module):
     def __init__(self):
         super(Model, self).__init__()
-        self.embedding = torch.nn.Embedding(len(tokens), 32, padding_idx=26)
+        self.embedding = torch.nn.Embedding(len(tokens), 32)
         self.pos_encoder = PositionalEncoding(32)
         self.attention = torch.nn.MultiheadAttention(embed_dim=32, num_heads=2, batch_first=True)
         self.fc = torch.nn.Linear(32, len(tokens))
