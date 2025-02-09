@@ -7,37 +7,33 @@ import string
 import math
 import random
 
-tokens = string.ascii_lowercase + "#" # Add padding token
+tokens = string.ascii_lowercase + " #" # Add space and padding token
+PADDING_IDX = tokens.index("#")
 
 print(tokens)
 
 # Context window is 10, for next token prediction we can generate up to 9; for PPO upto 7
-def generate_data(n_samples, max_len=6, for_ppo=False, total_length=10):
+def generate_data(n_samples, max_len=6, total_length=10):
     samps = []
     max_seq = total_length - 1 # at least one padding token
     for i in range(n_samples):
         seq_len = random.randint(1, max_len)
-        seq = [random.randint(0, len(tokens) - 2) for _ in range(seq_len)] # 0-25 and hash is 26
+        seq = [random.randint(0, len(tokens) - 2) for _ in range(seq_len)] # 0-26 and # is 27
         mask = [1] * seq_len + [0] * (total_length - seq_len)
-        # Target should be the sum of the tokens mod 26, for basic model.
-        # For PPO, the target should be the sum of the tokens mod 26, the next token should be that sum + 1 mod 26, and the next one should be that sum + 2 mod 26
-        
-        if for_ppo:
-            last_token = seq[seq_len-1]
-            if seq_len > 1:
-                second_last_token = seq[seq_len-2]
-            else:
-                second_last_token = 26
-            if seq_len > 2:
-                third_last_token = seq[seq_len-3]
-            else:
-                third_last_token = 26
-            # target = [(last_token+1)%26, (last_token+1)%26, (last_token+1)%26]# THIS WORKS
-            target = [last_token, second_last_token, third_last_token]
+
+        last_token = seq[seq_len-1]
+        if seq_len > 1:
+            second_last_token = seq[seq_len-2]
         else:
-            target = [seq[seq_len-1]]#sum(seq) % 26
+            second_last_token = PADDING_IDX
+        if seq_len > 2:
+            third_last_token = seq[seq_len-3]
+        else:
+            third_last_token = PADDING_IDX
+        target = [last_token, second_last_token, third_last_token]
+
         if len(seq) <= total_length:
-            seq += [tokens.index('#')] * (total_length - seq_len)
+            seq += [PADDING_IDX] * (total_length - seq_len)
         assert len(seq) == total_length == len(mask)
         samps.append((seq, target, mask))
     return samps
@@ -98,9 +94,8 @@ def train(model, data, epochs=20):
         for seq, target, mask in datas:
             output = model(seq, mask) # both are (bs, seq_len, 1)
             output = output.squeeze(0)
-            padding_value = 26
             seq_length = mask.size(1)
-            new_target = torch.full((batch_size, seq_length), padding_value, dtype=torch.long)
+            new_target = torch.full((batch_size, seq_length), PADDING_IDX, dtype=torch.long)
             next_tokens_only_mask = torch.zeros_like(mask)
 
             for i in range(batch_size):
@@ -121,7 +116,7 @@ def train(model, data, epochs=20):
         if epoch % 3 == 0:
             print(f"Epoch {epoch}, Loss: {loss.item()}")
 
-examples = generate_data(2000, max_len=7, total_length=10, for_ppo=True)
+examples = generate_data(2000, max_len=7, total_length=10)
 
 model = Model()
 try:
@@ -130,7 +125,7 @@ except KeyboardInterrupt:
     pass
 
 num_eval = 50
-eval_examples = generate_data(num_eval, max_len=7, total_length=10, for_ppo=True)#examples[:num_eval]#
+eval_examples = generate_data(num_eval, max_len=7, total_length=10)#examples[:num_eval]#
 total_correct = 0
 for seq, target, mask in eval_examples:
     seq = torch.tensor([seq])
@@ -139,8 +134,7 @@ for seq, target, mask in eval_examples:
     output = output.squeeze(0)
     relevant_index = (mask == 1).nonzero(as_tuple=True)[1][-1].item()
     seq_length = mask.size(1)
-    padding_value = tokens.index('#')
-    new_target = torch.full((seq_length, ), padding_value, dtype=torch.long)
+    new_target = torch.full((seq_length, ), PADDING_IDX, dtype=torch.long)
     new_target[relevant_index + 1] = target[0]
     new_target[relevant_index + 2] = target[1]
     new_target[relevant_index + 3] = target[2]
@@ -157,7 +151,7 @@ print(f"Accuracy: {total_correct / num_eval}")
 
 import sys; sys.exit(1)
 
-# Now modify it, the example data should change so that the next token is the sum (still), the next one is that sum + 1 (%26) and again + 1 for the next one
+# Now modify it, the example data should change so that the next token is the sum (still), the next one is that sum + 1 (%27) and again + 1 for the next one
 # Note (and this is NO LONGER true currently as well) the output shape should be larger, ie max seq len needs to reduce by 3 (and by 1 currently)
 # Use PPO to learn this, starting from the trained model.
 
@@ -294,7 +288,7 @@ class PPO:
             
 
 if __name__ == "__main__":
-    examples = generate_data(10, max_seq=10, max_len=7, for_ppo=True)
+    examples = generate_data(10, max_seq=10, max_len=7)
     ppo = PPO(model, examples)
     ppo.train(examples, timesteps=5000)
     ppo.eval()
