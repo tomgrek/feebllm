@@ -44,7 +44,28 @@ def get_batch(data, bs=8):
         batch_seq = torch.tensor([seq]).reshape(bs, len(seq[0]), 1)
         batch_target = torch.tensor([target]).reshape(bs, len(target[0]), 1)
         batch_mask = torch.tensor([mask]).reshape(bs, len(mask[0]), 1)
-        return batch_seq, batch_target, batch_mask
+
+        seq_length = batch_mask.size(1)
+        new_target = torch.full((bs, seq_length), PADDING_IDX, dtype=torch.long)
+        next_tokens_only_mask = torch.zeros_like(batch_mask)
+
+        for i in range(bs):
+            relevant_index = (batch_mask[i].squeeze(0) == 1).nonzero(as_tuple=True)[0][-1].item()
+            new_target[i, relevant_index + 1] = batch_target[i][0].item()
+            new_target[i, relevant_index + 2] = batch_target[i][1].item()
+            new_target[i, relevant_index + 3] = batch_target[i][2].item()
+            next_tokens_only_mask[i, relevant_index + 1] = 1
+            next_tokens_only_mask[i, relevant_index + 2] = 1
+            next_tokens_only_mask[i, relevant_index + 3] = 1
+            batch_mask[i, relevant_index + 1] = 1
+            batch_mask[i, relevant_index + 2] = 1
+            batch_mask[i, relevant_index + 3] = 1
+
+        # Input sequence, target, input mask, output mask
+        # Target is [padding, padding, target1, target2, target3, padding...]
+        # Batch mask is the input mask: 1 for both sequence input positions + target positions
+        # Output mask is 1 for only the target positions
+        return batch_seq, new_target, batch_mask, next_tokens_only_mask
 
 class PositionalEncoding(torch.nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -70,18 +91,9 @@ class Model(torch.nn.Module):
     def forward(self, x, mask):
         x = self.embedding(x)
         x = self.pos_encoder(x)
-        new_mask = mask.clone()
-        batch_size = mask.size(0)
-        
-        for i in range(batch_size):
-            relevant_index = (new_mask[i].squeeze(0) == 1).nonzero(as_tuple=True)[0][-1].item()
-            if relevant_index < new_mask.size(1) - 1:
-                new_mask[i, relevant_index + 1] = 1
-                new_mask[i, relevant_index + 2] = 1
-                new_mask[i, relevant_index + 3] = 1
-        x = x * new_mask
+        x = x * mask
         x = x.squeeze(2)
-        x, _ = self.attention(x, x, x, key_padding_mask=(new_mask == 0).squeeze(-1))
+        x, _ = self.attention(x, x, x, key_padding_mask=(mask == 0).squeeze(-1))
         x = self.fc(x)
         return x
 
@@ -91,24 +103,11 @@ def train(model, data, epochs=20):
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
     for epoch in range(epochs):
         datas = [get_batch(data, bs=batch_size) for _ in range(100)]
-        for seq, target, mask in datas:
-            output = model(seq, mask) # both are (bs, seq_len, 1)
-            output = output.squeeze(0)
-            seq_length = mask.size(1)
-            new_target = torch.full((batch_size, seq_length), PADDING_IDX, dtype=torch.long)
-            next_tokens_only_mask = torch.zeros_like(mask)
+        for seq, target, input_mask, output_mask in datas:
+            output = model(seq, input_mask) # both are (bs, seq_len, 1). Target is (bs, seq_len).
 
-            for i in range(batch_size):
-                relevant_index = (mask[i].squeeze(0) == 1).nonzero(as_tuple=True)[0][-1].item()
-                new_target[i, relevant_index + 1] = target[i][0].item()
-                new_target[i, relevant_index + 2] = target[i][1].item() # 3 tokens, for PPO
-                new_target[i, relevant_index + 3] = target[i][2].item()
-                next_tokens_only_mask[i, relevant_index + 1] = 1
-                next_tokens_only_mask[i, relevant_index + 2] = 1
-                next_tokens_only_mask[i, relevant_index + 3] = 1
-
-            loss = torch.nn.functional.cross_entropy(output.permute(0, 2, 1), new_target, reduction='none')
-            loss = (loss * next_tokens_only_mask.squeeze(-1)).sum() / next_tokens_only_mask.sum()
+            loss = torch.nn.functional.cross_entropy(output.permute(0, 2, 1), target, reduction='none')
+            loss = (loss * output_mask.squeeze(-1)).sum() / output_mask.sum()
             
             optimizer.zero_grad()
             loss.backward()
@@ -127,26 +126,19 @@ except KeyboardInterrupt:
 num_eval = 50
 eval_examples = generate_data(num_eval, max_len=7, total_length=10)#examples[:num_eval]#
 total_correct = 0
-for seq, target, mask in eval_examples:
-    seq = torch.tensor([seq])
-    mask = torch.tensor([mask])
-    output = model(seq.reshape(1, -1, 1), mask.reshape(1, -1, 1))
+
+for i in range(num_eval):
+    seq, target, input_mask, output_mask = get_batch(eval_examples, bs=1)
+    output = model(seq, input_mask)
     output = output.squeeze(0)
-    relevant_index = (mask == 1).nonzero(as_tuple=True)[1][-1].item()
-    seq_length = mask.size(1)
-    new_target = torch.full((seq_length, ), PADDING_IDX, dtype=torch.long)
-    new_target[relevant_index + 1] = target[0]
-    new_target[relevant_index + 2] = target[1]
-    new_target[relevant_index + 3] = target[2]
+    relevant_index = (output_mask == 1).nonzero(as_tuple=True)[1][0].item()
     
-    prediction1 = output[relevant_index + 1].argmax().item()
-    correct = prediction1 == new_target[relevant_index + 1].item()
-    prediction2 = output[relevant_index + 2].argmax().item()
-    correct += prediction2 == new_target[relevant_index + 2].item()
-    prediction3 = output[relevant_index + 3].argmax().item()
-    correct += prediction3 == new_target[relevant_index + 3].item()
-    total_correct += (correct / 3)
-    print(f"Prediction: {prediction1, prediction2, prediction3}, Target: {new_target[relevant_index+1].item(), new_target[relevant_index + 2].item(), new_target[relevant_index + 3].item()}")
+    target = target.squeeze(0)
+    predictions = output[relevant_index:relevant_index + 3].argmax(dim=-1)
+    targets = target[relevant_index:relevant_index + 3]
+    correct = (predictions == targets).sum().item()
+    print(f"Prediction: {[x.item() for x in predictions]}, Target: {[x.item() for x in targets]}")
+    total_correct += correct / 3
 print(f"Accuracy: {total_correct / num_eval}")
 
 import sys; sys.exit(1)
