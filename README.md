@@ -3,10 +3,10 @@
 # Status
 
 Attention works, in batches, to predict sequences :)
+It's learning the corpus, but not doing a fantastic job at that. Code is refactored to enable different seq lengths and num predicted tokens. Predicting a single token seems to be better.
 
 # TODO
 
-* Clean up. Only generate the tensors (seq, mask, target -- and make it the ACTUAL target !!!) in one place.
 * Have it actually learn from a corpus and generate some text. This is interesting cos it's a multi-token output whereas LLMs are usually single token autoregressive... which means temperature/sampling sort of makes less sense.. but still poss..
 * Add PPO
 * Change PPO to GRPO
