@@ -22,8 +22,8 @@ Puck (or as he was sometimes called, Robin Goodfellow) was a shrewd and knavish 
 All this time Dorothy and her companions had been walking through the thick woods. The road was still paved with yellow brick, but these were much covered by dried branches and dead leaves from the trees, and the walking was not at all good.
 Even with eyes protected by the green spectacles, Dorothy and her friends were at first dazzled by the brilliancy of the wonderful City. The streets were lined with beautiful houses all built of green marble and studded everywhere with sparkling emeralds. They walked over a pavement of the same green marble, and where the blocks were joined together were rows of emeralds, set closely, and glittering in the brightness of the sun. The window panes were of green glass; even the sky above the City had a green tint, and the rays of the sun were green.
 """
-corpus += 10*" robin goodfellow was a shrewd and knavish sprite that used to play comical pranks in the neighbouring villages sometimes getting into the dairies and skimming the milk sometimes plunging his light and airy form into the butter churn and while he was dancing his fantastic shape in the churn in vain the dairymaid would labour to change her cream into butter."
-#corpus = "abcdefghijklmnopqrstuvwxyz " * 5
+#corpus += 10*" robin goodfellow was a shrewd and knavish sprite that used to play comical pranks in the neighbouring villages sometimes getting into the dairies and skimming the milk sometimes plunging his light and airy form into the butter churn and while he was dancing his fantastic shape in the churn in vain the dairymaid would labour to change her cream into butter."
+corpus = "abcdefghijklmnopqrstuvwxyz " * 5
 corpus = [x for x in corpus.lower() if x in tokens.replace("#", "")]
 
 # Context window is 10, for next token prediction we can generate up to 9; for PPO upto 7
@@ -152,11 +152,11 @@ def train(model, data, epochs=20, early_stop=-float("inf")):
             break
 
 examples = generate_data(10000, max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS_AT_A_TIME,
-                         total_length=TOTAL_SEQUENCE_LENGTH, min_len=3)
+                         total_length=TOTAL_SEQUENCE_LENGTH, min_len=4)
 
 model = Model(embedding_dim=64)
 try:
-    train(model, examples, epochs=10000, early_stop=0.0005)
+    train(model, examples, epochs=10000, early_stop=0.0001)
 except KeyboardInterrupt:
     pass
 model.eval()
@@ -185,76 +185,67 @@ for i in range(num_eval):
     total_correct += correct / PREDICT_N_TOKENS_AT_A_TIME
 print(f"Accuracy: {total_correct / num_eval}")
 
-def generate(prompt, iterations=3, max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS_AT_A_TIME, total_length=TOTAL_SEQUENCE_LENGTH):
+def generate(prompt, iterations=3,
+             max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS_AT_A_TIME,
+             total_length=TOTAL_SEQUENCE_LENGTH,
+             beam_width=10):
     print(f"---- STARTING PROMPT: {prompt} ----")
     if len(prompt) > max_len:
         raise ValueError("Prompt too long")
-    pred_str = prompt
-    for i in range(iterations):
+    beams = [(prompt, 0.0, prompt)]
+
+    for _ in range(iterations):
+        new_beams = []
         
-        int_seq = [tokens.index(x) for x in prompt]
-        mask = [1] * len(int_seq) + [0] * (total_length - len(int_seq))
-        if len(int_seq) <= total_length:
-            int_seq += [PADDING_IDX] * (total_length - len(int_seq))
+        for seq, cum_log_prob, full_seq in beams:
+            int_seq = [tokens.index(x) for x in seq]
+            mask = [1] * len(int_seq) + [0] * (total_length - len(int_seq))
+            if len(int_seq) < total_length:
+                int_seq += [PADDING_IDX] * (total_length - len(int_seq))
         
-        assert len(int_seq) == len(mask)
-        seq = torch.tensor([int_seq]).reshape(1, len(int_seq), 1)
-        mask = torch.tensor([mask]).reshape(1, len(mask), 1)
+            assert len(int_seq) == len(mask)
+            seq_tensor = torch.tensor([int_seq]).reshape(1, len(int_seq), 1)
+            mask_tensor = torch.tensor([mask]).reshape(1, len(mask), 1)
 
-        output = model(seq, mask)
-        output = output.squeeze(0)
-        relevant_index = (mask == 1).nonzero(as_tuple=True)[1][-1].item() + 1
-        predictions = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME].argmax(dim=-1) # greedy, no sampling
-        #print(predictions.flatten())
-        #print("---")
-        str_pred = "".join([tokens[x.item()] for x in predictions])
-        prompt += str_pred
-        pred_str += str_pred
-        #print(prompt, str_pred)
+            output = model(seq_tensor, mask_tensor)
+            output = output.squeeze(0)
+            relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
+            logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
+            
+            topk_probs, topk_indices = torch.topk(torch.nn.functional.log_softmax(logits, dim=-1), beam_width, dim=-1)
+            for i in range(beam_width):
+                new_seq = seq + tokens[topk_indices[0, i].item()]
+                new_cum_log_prob = cum_log_prob + topk_probs[0, i].item()
+                full_seq += tokens[topk_indices[0, i].item()]
+                if len(new_seq) > max_len:
+                    new_seq = new_seq[PREDICT_N_TOKENS_AT_A_TIME:]
+                new_beams.append((new_seq, new_cum_log_prob, full_seq))
+        beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_width]
+    
+    return [(x[2], round(x[1], 3)) for x in beams]
 
-        if len(prompt) >= max_len:
-            prompt = prompt[PREDICT_N_TOKENS_AT_A_TIME:]
+print(generate("abcdefghi", 30))
+print(generate(" abcdefgh", 30))
+print(generate("abc", 22))
+print(generate("abcd", 25))
+print(generate("wxyz", 15))
 
-        # extend seq by predictions, limiting it to max 7 tokens
-        
-        # if relevant_index + PREDICT_N_TOKENS_AT_A_TIME >= max_len:
-        #     # shuffle it back, dropping the first 3 tokens
-        #     #roll_amount = max_len - relevant_index - PREDICT_N_TOKENS_AT_A_TIME
-        #     roll_amount = -PREDICT_N_TOKENS_AT_A_TIME
-        #     assert roll_amount < 0
-        #     seq = seq.roll(roll_amount, dims=1)
-        #     seq[0, relevant_index-PREDICT_N_TOKENS_AT_A_TIME:relevant_index, 0] = predictions.view(-1)
-        #     mask[0, relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME, 0] = 1
-        #     seq[0, roll_amount:, 0] = PADDING_IDX#seq[0, roll_amount:, 0] = PADDING_IDX
-        #     mask[0, roll_amount:, 0] = 0
-        # else:
-        #     seq[0, relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME, 0] = predictions.view(-1)
-        #     mask[0, relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME, 0] = 1
-
-    return pred_str
-
-# print(generate("abcdefghi", 30))
-# print(generate(" abcdefgh", 30))
-# print(generate("abc", 22))
-# print(generate("abcd", 25))
-# print(generate("wxyz", 15))
-
-print(generate("goodf", 20)) # Robin Goodfellow was a shrewd
-print(generate("goodfe", 20)) # Robin Goodfellow was a shrewd
-print(generate("goodfel", 20)) # Robin Goodfellow was a shrewd
-print(generate("goodfell", 20)) # Robin Goodfellow was a shrewd
-print(generate("goodfello", 20)) # Robin Goodfellow was a shrewd
-print(generate("goodfellow", 20)) # Robin Goodfellow was a shrewd
-print(generate("goodfellow ", 20)) # Robin Goodfellow was a shrewd
-print(generate("goodfellow w", 20)) # Robin Goodfellow was a shrewd
-print(generate("goodfellow wa", 20)) # Robin Goodfellow was a shrewd
-print(generate("goodfellow was", 20)) # Robin Goodfellow was a shrewd
-print(generate("robin ", 20)) # Robin Goodfellow was a shrewd
-print(generate("robin goo", 20)) # Robin Goodfellow was a shrewd
-print(generate("comical", 20)) # comical pranks
-print(generate("comical ", 20)) # comical pranks
-print(generate("comical p", 20)) # comical pranks
-print(generate("comical pr", 20)) # comical pranks
+# print(generate("goodf", 20)) # Robin Goodfellow was a shrewd
+# print(generate("goodfe", 20)) # Robin Goodfellow was a shrewd
+# print(generate("goodfel", 20)) # Robin Goodfellow was a shrewd
+# print(generate("goodfell", 20)) # Robin Goodfellow was a shrewd
+# print(generate("goodfello", 20)) # Robin Goodfellow was a shrewd
+# print(generate("goodfellow", 20)) # Robin Goodfellow was a shrewd
+# print(generate("goodfellow ", 20)) # Robin Goodfellow was a shrewd
+# print(generate("goodfellow w", 20)) # Robin Goodfellow was a shrewd
+# print(generate("goodfellow wa", 20)) # Robin Goodfellow was a shrewd
+# print(generate("goodfellow was", 20)) # Robin Goodfellow was a shrewd
+# print(generate("robin ", 20)) # Robin Goodfellow was a shrewd
+# print(generate("robin goo", 20)) # Robin Goodfellow was a shrewd
+# print(generate("comical", 20)) # comical pranks
+# print(generate("comical ", 20)) # comical pranks
+# print(generate("comical p", 20)) # comical pranks
+# print(generate("comical pr", 20)) # comical pranks
 
 import sys; sys.exit(1)
 
