@@ -23,7 +23,7 @@ All this time Dorothy and her companions had been walking through the thick wood
 Even with eyes protected by the green spectacles, Dorothy and her friends were at first dazzled by the brilliancy of the wonderful City. The streets were lined with beautiful houses all built of green marble and studded everywhere with sparkling emeralds. They walked over a pavement of the same green marble, and where the blocks were joined together were rows of emeralds, set closely, and glittering in the brightness of the sun. The window panes were of green glass; even the sky above the City had a green tint, and the rays of the sun were green.
 """
 #corpus += 10*" robin goodfellow was a shrewd and knavish sprite that used to play comical pranks in the neighbouring villages sometimes getting into the dairies and skimming the milk sometimes plunging his light and airy form into the butter churn and while he was dancing his fantastic shape in the churn in vain the dairymaid would labour to change her cream into butter."
-corpus = "abcdefghijklmnopqrstuvwxyz " * 5
+# corpus = "abcdefghijklmnopqrstuvwxyz " * 5
 corpus = [x for x in corpus.lower() if x in tokens.replace("#", "")]
 
 # Context window is 10, for next token prediction we can generate up to 9; for PPO upto 7
@@ -61,14 +61,15 @@ def get_batch(data, bs=8):
         seq_length = batch_mask.size(1)
         new_target = torch.full((bs, seq_length), PADDING_IDX, dtype=torch.long)
         next_tokens_only_mask = torch.zeros_like(batch_mask)
+        
 
         for i in range(bs):
             relevant_index = (batch_mask[i].squeeze(0) == 1).nonzero(as_tuple=True)[0][-1].item()
             for j in range(1, PREDICT_N_TOKENS_AT_A_TIME + 1):
                 new_target[i, relevant_index + j] = batch_target[i][j - 1].item()
                 next_tokens_only_mask[i, relevant_index + j] = 1
-                batch_mask[i, relevant_index + j] = 1
-
+                #batch_mask[i, relevant_index + j] = 1
+        
         # Input sequence, target, input mask, output mask
         # Target is [padding, padding, target1, target2, target3, padding...]
         # Batch mask is the input mask: 1 for both sequence input positions + target positions
@@ -91,7 +92,7 @@ class TransformerBlock(torch.nn.Module):
 
     def forward(self, x, mask):
         # Multi-head attention
-        attn_output, _ = self.attention(x, x, x, key_padding_mask=(mask == 0).squeeze(-1))
+        attn_output, _ = self.attention(x, x, x, attn_mask=self.causal_mask(x.size(1)), key_padding_mask=(mask == 0).squeeze(-1).float())
         x = self.layer_norm1(x + self.dropout(attn_output))
         
         # Feed-forward network
@@ -99,6 +100,11 @@ class TransformerBlock(torch.nn.Module):
         x = self.layer_norm2(x + self.dropout(ff_output))
         
         return x
+    
+    def causal_mask(self, sz):
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
     
 class Model(torch.nn.Module):
     def __init__(self, embedding_dim=32, num_heads=4, ff_hidden_dim=128, num_layers=6, max_len=TOTAL_SEQUENCE_LENGTH):
@@ -108,7 +114,6 @@ class Model(torch.nn.Module):
         self.transformer_blocks = torch.nn.ModuleList([
             TransformerBlock(embedding_dim, num_heads, ff_hidden_dim) for _ in range(num_layers)
         ])
-        # self.attention = torch.nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=16, batch_first=True)
         self.fc = torch.nn.Linear(embedding_dim, len(tokens))
         self.dropout = torch.nn.Dropout(0.1)
         self.layer_norm = torch.nn.LayerNorm(embedding_dim)
@@ -124,7 +129,6 @@ class Model(torch.nn.Module):
         for transformer_block in self.transformer_blocks:
             x = transformer_block(x, mask)
         
-        #x, _ = self.attention(x, x, x, key_padding_mask=(mask == 0).squeeze(-1))
         x = self.layer_norm(x)
         x = self.dropout(x)
         x = self.fc(x)
@@ -138,8 +142,10 @@ def train(model, data, epochs=20, early_stop=-float("inf")):
         datas = [get_batch(data, bs=batch_size) for _ in range(len(data) // batch_size)]
         for seq, target, input_mask, output_mask in datas:
             output = model(seq, input_mask) # both are (bs, seq_len, 1). Target is (bs, seq_len).
-
+            
             loss = torch.nn.functional.cross_entropy(output.permute(0, 2, 1), target, reduction='none')
+            
+            # in_plus_next_mask = torch.max(input_mask, output_mask) # predict seq as well as next token, or just use output_mask for next token only
             loss = (loss * output_mask.squeeze(-1)).sum() / output_mask.sum()
             
             optimizer.zero_grad()
@@ -155,8 +161,9 @@ examples = generate_data(10000, max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS
                          total_length=TOTAL_SEQUENCE_LENGTH, min_len=4)
 
 model = Model(embedding_dim=64)
+model.train()
 try:
-    train(model, examples, epochs=10000, early_stop=0.0001)
+    train(model, examples, epochs=10000, early_stop=0.01)
 except KeyboardInterrupt:
     pass
 model.eval()
@@ -224,28 +231,31 @@ def generate(prompt, iterations=3,
     
     return [(x[2], round(x[1], 3)) for x in beams]
 
-print(generate("abcdefghi", 30))
-print(generate(" abcdefgh", 30))
-print(generate("abc", 22))
-print(generate("abcd", 25))
-print(generate("wxyz", 15))
+# print(generate("abcdefghi", 30))
+# print(generate(" abcdefgh", 30))
+# print(generate("abc", 22))
+# print(generate("abcd", 25))
+# print(generate("wxyz", 15))
 
-# print(generate("goodf", 20)) # Robin Goodfellow was a shrewd
-# print(generate("goodfe", 20)) # Robin Goodfellow was a shrewd
-# print(generate("goodfel", 20)) # Robin Goodfellow was a shrewd
-# print(generate("goodfell", 20)) # Robin Goodfellow was a shrewd
-# print(generate("goodfello", 20)) # Robin Goodfellow was a shrewd
-# print(generate("goodfellow", 20)) # Robin Goodfellow was a shrewd
-# print(generate("goodfellow ", 20)) # Robin Goodfellow was a shrewd
-# print(generate("goodfellow w", 20)) # Robin Goodfellow was a shrewd
-# print(generate("goodfellow wa", 20)) # Robin Goodfellow was a shrewd
-# print(generate("goodfellow was", 20)) # Robin Goodfellow was a shrewd
-# print(generate("robin ", 20)) # Robin Goodfellow was a shrewd
-# print(generate("robin goo", 20)) # Robin Goodfellow was a shrewd
-# print(generate("comical", 20)) # comical pranks
-# print(generate("comical ", 20)) # comical pranks
-# print(generate("comical p", 20)) # comical pranks
-# print(generate("comical pr", 20)) # comical pranks
+print(generate("the quick", 25))
+print(generate("puck or as he", 25))
+print(generate("puck or as he w", 25))
+print(generate("goodf", 20)) # Robin Goodfellow was a shrewd
+print(generate("goodfe", 20)) # Robin Goodfellow was a shrewd
+print(generate("goodfel", 20)) # Robin Goodfellow was a shrewd
+print(generate("goodfell", 20)) # Robin Goodfellow was a shrewd
+print(generate("goodfello", 20)) # Robin Goodfellow was a shrewd
+print(generate("goodfellow", 20)) # Robin Goodfellow was a shrewd
+print(generate("goodfellow ", 20)) # Robin Goodfellow was a shrewd
+print(generate("goodfellow w", 20)) # Robin Goodfellow was a shrewd
+print(generate("goodfellow wa", 20)) # Robin Goodfellow was a shrewd
+print(generate("goodfellow was", 20)) # Robin Goodfellow was a shrewd
+print(generate("robin ", 20)) # Robin Goodfellow was a shrewd
+print(generate("robin goo", 20)) # Robin Goodfellow was a shrewd
+print(generate("comical", 20)) # comical pranks
+print(generate("comical ", 20)) # comical pranks
+print(generate("comical p", 20)) # comical pranks
+print(generate("comical pr", 20)) # comical pranks
 
 import sys; sys.exit(1)
 
