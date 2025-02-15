@@ -1,3 +1,87 @@
+from collections import Counter
+
+class TrieNode:
+    def __init__(self):
+        self.children = {}
+        self.end_of_token = False
+        self.token_id = None
+
+class TrieTokenizer:
+    def __init__(self, max_tokens=50):
+        self.root = TrieNode()
+        self.id_to_token = {0: '#', 1: ' ', 2: '\n'}
+        self.token_to_id = {'#': 0, ' ': 1, '\n': 2}
+        self.next_id = 3
+        self.max_tokens = max_tokens
+
+    def insert(self, token):
+        node = self.root
+        for char in token:
+            if char not in node.children:
+                node.children[char] = TrieNode()
+            node = node.children[char]
+        node.end_of_token = True
+        # Only assign a new ID if this exact token isn't already in self.token_to_id
+        if token not in self.token_to_id:
+            self.token_to_id[token] = self.next_id
+            self.id_to_token[self.next_id] = token
+            node.token_id = self.next_id
+            self.next_id += 1
+
+    def fit(self, corpus_tokens):
+        """
+        1. Collect all single characters from the corpus and insert them (ensuring coverage).
+        2. Use remaining slots for the most frequent multi-character tokens.
+        """
+        freqs = Counter(corpus_tokens)
+        unique_chars = set()
+        for token in corpus_tokens:
+            for ch in token:
+                unique_chars.add(ch)
+
+        # Step 1: Insert all unique single characters (e.g. 'a', 'b') to guarantee coverage
+        for ch in sorted(unique_chars):
+            if self.next_id < self.max_tokens:
+                self.insert(ch)
+
+        # Step 2: Insert the most common multi-character tokens until we run out of space
+        # Filter out single characters from the counter, so we only consider multi-char tokens
+        multi_char_tokens = [(t, f) for t, f in freqs.items() if len(t) > 1]
+        multi_char_tokens.sort(key=lambda x: x[1], reverse=True)
+
+        for token, _ in multi_char_tokens:
+            if self.next_id >= self.max_tokens:
+                break
+            self.insert(token)
+
+    def tokenize(self, text):
+        tokens = []
+        i = 0
+        while i < len(text):
+            node = self.root
+            last_match_id = None
+            last_match_pos = i
+            j = i
+            while j < len(text) and text[j] in node.children:
+                node = node.children[text[j]]
+                j += 1
+                if node.end_of_token:
+                    last_match_id = node.token_id
+                    last_match_pos = j
+            if last_match_id is not None:
+                tokens.append(last_match_id)
+                i = last_match_pos
+            else:
+                # If there's no match, fallback to single-character coverage
+                char_token = text[i]
+                # Because we guaranteed single-char coverage in fit(), it must exist
+                tokens.append(self.token_to_id[char_token])
+                i += 1
+        return tokens
+
+    def decode(self, ids):
+        return ''.join(self.id_to_token[i] for i in ids)
+
 # text generating model
 # given some token and a mask, predict the next token
 
@@ -8,9 +92,9 @@ import math
 import random
 
 tokens = string.ascii_lowercase + " .#" # Add space period and padding token
-PADDING_IDX = tokens.index("#")
+PADDING_IDX = 0# tokens.index("#")
 TOTAL_SEQUENCE_LENGTH = 20
-PREDICT_N_TOKENS_AT_A_TIME = 1
+PREDICT_N_TOKENS_AT_A_TIME = 2
 
 corpus = """
 The quick brown fox jumps over the lazy dog.
@@ -24,7 +108,18 @@ Even with eyes protected by the green spectacles, Dorothy and her friends were a
 """
 #corpus += 10*" robin goodfellow was a shrewd and knavish sprite that used to play comical pranks in the neighbouring villages sometimes getting into the dairies and skimming the milk sometimes plunging his light and airy form into the butter churn and while he was dancing his fantastic shape in the churn in vain the dairymaid would labour to change her cream into butter."
 # corpus = "abcdefghijklmnopqrstuvwxyz " * 5
-corpus = [x for x in corpus.lower() if x in tokens.replace("#", "")]
+
+corpus_tokens = corpus.replace("#", "").split()
+
+tokenizer = TrieTokenizer(max_tokens=54)
+tokenizer.fit(corpus_tokens)
+print(tokenizer.token_to_id)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# corpus = [x for x in corpus.lower() if x in tokens.replace("#", "")]
+corpus = tokenizer.tokenize(corpus)
 
 # Context window is 10, for next token prediction we can generate up to 9; for PPO upto 7
 def generate_data(n_samples, max_len=6, total_length=10, min_len=5):
@@ -41,8 +136,8 @@ def generate_data(n_samples, max_len=6, total_length=10, min_len=5):
         if len(target) != PREDICT_N_TOKENS_AT_A_TIME:
             continue  # TODO fix some edge case
         
-        seq = [tokens.index(x) for x in seq]
-        target = [tokens.index(x) for x in target]
+        # seq = [tokens.index(x) for x in seq]
+        # target = [tokens.index(x) for x in target]
 
         if len(seq) <= total_length:
             seq += [PADDING_IDX] * (total_length - seq_len)
@@ -54,13 +149,13 @@ def generate_data(n_samples, max_len=6, total_length=10, min_len=5):
 def get_batch(data, bs=8):
         batch = random.sample(data, bs)
         seq, target, mask = zip(*batch)
-        batch_seq = torch.tensor([seq]).reshape(bs, len(seq[0]), 1)
-        batch_target = torch.tensor([target]).reshape(bs, len(target[0]), 1)
-        batch_mask = torch.tensor([mask]).reshape(bs, len(mask[0]), 1)
+        batch_seq = torch.tensor([seq], device=device).reshape(bs, len(seq[0]), 1)
+        batch_target = torch.tensor([target], device=device).reshape(bs, len(target[0]), 1)
+        batch_mask = torch.tensor([mask], device=device).reshape(bs, len(mask[0]), 1)
 
         seq_length = batch_mask.size(1)
-        new_target = torch.full((bs, seq_length), PADDING_IDX, dtype=torch.long)
-        next_tokens_only_mask = torch.zeros_like(batch_mask)
+        new_target = torch.full((bs, seq_length), PADDING_IDX, dtype=torch.long, device=device)
+        next_tokens_only_mask = torch.zeros_like(batch_mask, device=device)
         
 
         for i in range(bs):
@@ -104,23 +199,25 @@ class TransformerBlock(torch.nn.Module):
     def causal_mask(self, sz):
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-        return mask
+        return mask.to(device)
     
 class Model(torch.nn.Module):
-    def __init__(self, embedding_dim=32, num_heads=4, ff_hidden_dim=128, num_layers=6, max_len=TOTAL_SEQUENCE_LENGTH):
+    def __init__(self, embedding_dim=32, num_heads=4, ff_hidden_dim=128, num_layers=6,
+                 max_len=TOTAL_SEQUENCE_LENGTH,
+                 num_tokens=100):
         super(Model, self).__init__()
-        self.embedding = torch.nn.Embedding(len(tokens), embedding_dim)
+        self.embedding = torch.nn.Embedding(num_tokens, embedding_dim)
         self.pos_embedding = torch.nn.Embedding(max_len, embedding_dim)
         self.transformer_blocks = torch.nn.ModuleList([
             TransformerBlock(embedding_dim, num_heads, ff_hidden_dim) for _ in range(num_layers)
         ])
-        self.fc = torch.nn.Linear(embedding_dim, len(tokens))
+        self.fc = torch.nn.Linear(embedding_dim, num_tokens)
         self.dropout = torch.nn.Dropout(0.1)
         self.layer_norm = torch.nn.LayerNorm(embedding_dim)
 
     def forward(self, x, mask):
         seq_length = x.size(1)
-        pos = torch.arange(seq_length, dtype=torch.long).unsqueeze(0).expand(x.size(0), -1)
+        pos = torch.arange(seq_length, dtype=torch.long, device=device).unsqueeze(0).expand(x.size(0), -1)
         
         x = self.embedding(x) + self.pos_embedding(pos.unsqueeze(2))
         x = x.squeeze(2)
@@ -135,7 +232,7 @@ class Model(torch.nn.Module):
         return x
 
 
-batch_size = 16
+batch_size = 128
 def train(model, data, epochs=20, early_stop=-float("inf")):
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
     for epoch in range(epochs):
@@ -161,7 +258,7 @@ def train(model, data, epochs=20, early_stop=-float("inf")):
 examples = generate_data(10000, max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS_AT_A_TIME,
                          total_length=TOTAL_SEQUENCE_LENGTH, min_len=4)
 
-model = Model(embedding_dim=64)
+model = Model(embedding_dim=64, num_tokens=54).to(device)#len(tokenizer.id_to_token)).to(device)
 model.train()
 try:
     train(model, examples, epochs=10000, early_stop=0.01)
@@ -185,9 +282,9 @@ for i in range(num_eval):
     targets = target[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
     correct = (predictions == targets).sum().item()
     predictions = [x.item() for x in predictions]
-    token_pred = "".join([tokens[x] for x in predictions])
+    token_pred = tokenizer.decode(predictions)
     targets = [x.item() for x in targets]
-    token_targets = "".join([tokens[x] for x in targets])
+    token_targets = tokenizer.decode(targets)
     print(f"Prediction: {predictions}, Target: {targets}")
     print(f"English prediction: {token_pred}, English target: {token_targets}")
     total_correct += correct / PREDICT_N_TOKENS_AT_A_TIME
@@ -206,27 +303,29 @@ def generate(prompt, iterations=3,
         new_beams = []
         
         for seq, cum_log_prob, full_seq in beams:
-            int_seq = [tokens.index(x) for x in seq]
+            int_seq = tokenizer.tokenize(seq)
             mask = [1] * len(int_seq) + [0] * (total_length - len(int_seq))
             if len(int_seq) < total_length:
                 int_seq += [PADDING_IDX] * (total_length - len(int_seq))
-        
             assert len(int_seq) == len(mask)
-            seq_tensor = torch.tensor([int_seq]).reshape(1, len(int_seq), 1)
-            mask_tensor = torch.tensor([mask]).reshape(1, len(mask), 1)
+            seq_tensor = torch.tensor([int_seq], device=device).reshape(1, len(int_seq), 1)
+            mask_tensor = torch.tensor([mask], device=device).reshape(1, len(mask), 1)
+            assert mask_tensor.view(-1)[-1] == 0
 
-            output = model(seq_tensor, mask_tensor)
+            with torch.no_grad():
+                output = model(seq_tensor, mask_tensor)
             output = output.squeeze(0)
             relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
             logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
             
             topk_probs, topk_indices = torch.topk(torch.nn.functional.log_softmax(logits, dim=-1), beam_width, dim=-1)
             for i in range(beam_width):
-                new_seq = seq + tokens[topk_indices[0, i].item()]
-                new_cum_log_prob = cum_log_prob + topk_probs[0, i].item()
-                full_seq += tokens[topk_indices[0, i].item()]
-                if len(new_seq) > max_len:
-                    new_seq = new_seq[PREDICT_N_TOKENS_AT_A_TIME:]
+                best = topk_indices[:PREDICT_N_TOKENS_AT_A_TIME, i].tolist()
+                new_seq = seq + tokenizer.decode(best)
+                new_cum_log_prob = cum_log_prob + topk_probs[:PREDICT_N_TOKENS_AT_A_TIME, i].sum().item() #topk_probs[0, i].item()
+                full_seq += tokenizer.decode(best)
+                if len(int_seq + best) >= max_len:
+                    new_seq = tokenizer.decode((int_seq + best)[PREDICT_N_TOKENS_AT_A_TIME + 1:]) # Extra one as at least one padding token
                 new_beams.append((new_seq, new_cum_log_prob, full_seq))
         beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_width]
     
@@ -401,3 +500,17 @@ if __name__ == "__main__":
     ppo = PPO(model, examples)
     ppo.train(examples, timesteps=5000)
     ppo.eval()
+
+# Example usage
+corpus = "The quick brown fox jumps over the lazy dog a b c d e f g h i j k l m n o p q r s t u v w x y z"
+corpus_tokens = corpus.split()  # or any list of tokens
+
+tokenizer = TrieTokenizer()
+tokenizer.fit(corpus_tokens)
+
+test_text = "The quick brown fox y z boab"
+encoded = tokenizer.tokenize(test_text)
+decoded = tokenizer.decode(encoded)
+
+print("Encoded IDs:", encoded)
+print("Decoded text:", decoded)

@@ -8,10 +8,15 @@ It's learning the corpus, but not doing a fantastic job at that. Code is refacto
 
 # TODO
 
-* Look at the generate() output after it reaches the max length. The last token isn't set correctly, it is just set to PADDING_IDX. Mask is fine. FIX!!!!!
-* Get it generating the alphabet, at least...
-* Add multiple transformer blocks... see chat...
-* Have it actually learn from a corpus and generate some text. This is interesting cos it's a multi-token output whereas LLMs are usually single token autoregressive... which means temperature/sampling sort of makes less sense.. but still poss..
+* Instead of limiting the vocab, have it only pick training examples from the text where the previous token is a whitespace. That will ensure
+it's not splitting words and gunking up the learning with sometimes full words and sometimes individual tokens.
+* Positional embeddings may lose meaning when its possibly single tokens and possibly whole words!?!?
+* Batch norm might be helpful?? See chat. Probably not since batches are vee large now so the noise is low.
+* WIP Make the generate method work with multiple tokens. It "works" now, but not well cos it only concatenates one. ADDENDUM: I actually made
+it work last thing with the `num_predicted_tokens` parameter. But I totally didn't do any validation that it's working correctly.
+* Convert the get_batch into a dataloader with pin memory.
+
+
 * Add PPO
 * Change PPO to GRPO
 
