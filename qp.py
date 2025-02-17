@@ -10,15 +10,13 @@ print(f"Using device: {device}")
 PADDING_IDX = 0
 TOTAL_SEQUENCE_LENGTH = 20
 PREDICT_N_TOKENS_AT_A_TIME = 1
-MAX_VOCAB_SIZE = 200
+MAX_VOCAB_SIZE = 29 # Must be <= number of tokens in the corpus
 BATCH_SIZE = 128  # Max, will use smaller batches sometimes
 
 corpus = """
-In some systems, it is obvious how economic dominant minorities control the state. In feudalism, for example, the land was owned by the feudal lords who exploited the peasantry directly. Economic and political power were merged into the same set of hands, the landlords. Absolutism saw the monarch bring the feudal lords under his power and the relative decentralised nature of feudalism was replaced by a centralised state.
-It was this centralised state system which the raising bourgeoisie took as the model for their state. The King was replaced by a Parliament, which was initially elected on a limited suffrage. In this initial form of capitalist state, it is (again) obvious how the elite maintain control of the state machine. As the vote was based on having a minimum amount of property, the poor were effectively barred from having any (official) say in what the government did. This exclusion was theorised by philosophers like John Locke—the working masses were considered to be an object of state policy rather than part of the body of people (property owners) who nominated the government. In this perspective the state was like a joint-stock company. The owning class were the share-holders who nominated the broad of directors and the mass of the population were the workers who had no say in determining the management personnel and were expected to follow orders.
-As would be expected, this system was mightily disliked by the majority who were subjected to it. Such a "classical liberal" regime was rule by an alien, despotic power, lacking popular legitimacy, and utterly unaccountable to the general population. It is quite evident that a government elected on a limited franchise could not be trusted to treat those who owned no real property with equal consideration. It was predictable that the ruling elite would use the state they controlled to further their own interests and to weaken potential resistance to their social, economic and political power. Which is precisely what they did do, while masking their power under the guise of "good governance" and "liberty." Moreover, limited suffrage, like absolutism, was considered an affront to liberty and individual dignity by many of those subject to it.
-This is unsurprising as we, as a species, shape our environment and, consequently, whatever shapes us will impact how we do so. This means that the individuals produced by the hierarchy (and the authoritarian mentality it produces) will shape the planet in specific, harmful, ways. This is to be expected as humans act upon their environment deliberately, creating what is most suitable for their mode of existence. If that mode of living is riddled with hierarchies, classes, states and the oppression, exploitation and domination they create then our relations with the natural world will hardly be any better. In other words, social hierarchy and class legitimises our domination of the environment, planting the seeds for the believe that nature exists, like other people, to be dominated and used as required.
-As the gap grows between rich and poor (indicating an increase in social hierarchy within and outwith of workplaces) the health of a people deteriorates and the social fabric unravels. The psychological hardship of being low down on the social ladder has detrimental effects on people, beyond whatever effects are produced by the substandard housing, nutrition, air quality, recreational opportunities, and medical care enjoyed by the poor.
+a b c d e f g h i j k l m n o p q r s t u v w x y z
+a b c d e f g h i j k l m n o p q r s t u v w x y z
+a b c d e f g h i j k l m n o p q r s t u v w x y z
 """
 # Using # for padding so strip it
 corpus_tokens = corpus.replace("#", "").split()
@@ -313,10 +311,12 @@ def generate(prompt, iterations=3,
     
     return [(x[2], round(x[1], 3)) for x in beams]
 
-print(generate("In some systems,", 25))
-print(generate("The King", 25))
-print(generate("feudal lords", 25))
-print(generate("you peasant", 25))
+print(generate("a b c", 25))
+print(generate("l m n o", 25))
+#print(generate("In some systems,", 25))
+# print(generate("The King", 25))
+# print(generate("feudal lords", 25))
+# print(generate("you peasant", 25))
 
 #############################################
 
@@ -334,10 +334,12 @@ class PolicyNetwork(torch.nn.Module):
 class ValueNetwork(torch.nn.Module):
     def __init__(self, embedding_dim, num_tokens):
         super(ValueNetwork, self).__init__()
+        self.embedding = torch.nn.Embedding(num_tokens, embedding_dim)
         self.fc1 = torch.nn.Linear(embedding_dim, 128)
         self.fc2 = torch.nn.Linear(128, 1)
 
     def forward(self, x):
+        x = self.embedding(x)
         x = torch.relu(self.fc1(x))
         value = self.fc2(x)
         return value
@@ -354,16 +356,24 @@ class PPO:
         self.update_epochs = update_epochs
 
     def compute_advantages(self, rewards, values, masks):
+        # Ignore masks for now since it'll always be MAX LENGTH
         advantages = []
         returns = []
         advantage = 0
         return_ = 0
+
+        # Initialize the last return with the last reward
+        return_ = rewards[-1]
+        returns.append(torch.tensor(return_, device=device))
+
         for i in reversed(range(len(rewards) - 1)):
-            return_ = rewards[i] + self.gamma * return_ * masks[i]
-            td_error = rewards[i] + self.gamma * values[i + 1] * masks[i] - values[i]
-            advantage = td_error + self.gamma * advantage * masks[i]
-            returns.insert(0, return_.clone().detach())
+            return_ = rewards[i] + self.gamma * return_  # Compute the return for the current step
+            returns.insert(0, torch.tensor(return_, device=device))  # Insert at the beginning of the list
+
+            td_error = rewards[i] + self.gamma * values[i + 1].squeeze(2) - values[i].squeeze(2)
+            advantage = td_error + self.gamma * advantage
             advantages.insert(0, advantage.clone().detach())
+
         return advantages, returns
 
     def update(self, trajectories):
@@ -379,12 +389,14 @@ class PPO:
 
                 surr1 = ratio * advantage
                 surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantage
-                policy_loss = torch.min(surr1, surr2).mean() # SHOULD BE A MINUS !!!!!!!!!!!!!!!!!!!!!!!!!!!!! THERE WAS A MINUS HERE!!!!!!!!!!!!!!!!!
 
-                with torch.no_grad():
-                    embeddings = self.policy_net.model.embedding(state)
-                value = self.value_net(embeddings.squeeze(2))
-                value_loss = (return_ - value).pow(2).mean()
+                relevant_index = (mask == 1).nonzero(as_tuple=True)[1][-1].item() + 1
+                
+                policy_loss = -torch.min(surr1, surr2).mean() # SHOULD BE A MINUS !!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+                value = self.value_net(state)
+                a = return_ - value.squeeze(2)
+                value_loss = a[:, :relevant_index + 1].pow(2).mean()
 
                 self.policy_optimizer.zero_grad()
                 policy_loss.backward()
@@ -406,9 +418,9 @@ def collect_trajectories(policy_net, value_net, prompts,
     log_probs = []
     values = []
 
-    for prompt in prompts:
+    for prompt in prompts:#[:1]:
         int_seq = tokenizer.tokenize(prompt) 
-        iterations = TOTAL_SEQUENCE_LENGTH - len(int_seq) - PREDICT_N_TOKENS_AT_A_TIME
+        iterations = TOTAL_SEQUENCE_LENGTH - len(int_seq) - PREDICT_N_TOKENS_AT_A_TIME # Predict a long sequence as rewards flow back
         cum_log_prob = 0.0
         while iterations > 0:
             true_seq = deepcopy(int_seq)   
@@ -424,10 +436,9 @@ def collect_trajectories(policy_net, value_net, prompts,
             assert len(int_seq) == len(mask)
             assert mask_tensor.view(-1)[-1] == 0
 
-            with torch.no_grad():
-                output = policy_net(seq_tensor, mask_tensor)
+            output = policy_net(seq_tensor, mask_tensor)
 
-            output = output.squeeze(0)
+            output = output.squeeze(0)  # This chops off the batch dimension??????????
             relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
             logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
             
@@ -440,14 +451,18 @@ def collect_trajectories(policy_net, value_net, prompts,
             
             actions.append(action)
             log_probs.append(log_prob.detach())
-            with torch.no_grad():
-                embeddings = policy_net.model.embedding(seq_tensor.detach()).detach()
-            values.append(value_net(embeddings.squeeze(2)))
+            values.append(value_net(seq_tensor))#[:, :relevant_index + 1, :]).squeeze(2))
             iterations -= 1
             if iterations == 0:
-                rewards.append(cum_log_prob)
+                # rewards.append(cum_log_prob) # Maybe cos this is always neg I had to flip the sign.
+                seq_text = tokenizer.decode(int_seq)
+                num_ks = seq_text.count("c") * 10 / TOTAL_SEQUENCE_LENGTH
+                #num_whitespaces = (TOTAL_SEQUENCE_LENGTH - seq_text.count(" ")) / TOTAL_SEQUENCE_LENGTH
+                # num_ks += 10 / abs(cum_log_prob)
+                rewards.append(num_ks)# + (num_whitespaces/100))#1.0)#num_ks)
             else:
                 rewards.append(0.0)
+            #print("lets have a look")
     
     return states, actions, rewards, masks, log_probs, values
 
@@ -462,11 +477,19 @@ ppo = PPO(policy_net, value_net)
 num_epochs = 1000
 num_steps = 2048
 
+# prompts = [
+#     "In some systems,",
+#     "The King",
+#     "feudal lords",
+#     "you peasant"
+# ]
 prompts = [
-    "In some systems,",
-    "The King",
-    "feudal lords",
-    "you peasant"
+    "a b ",
+    "a b c ",
+    "a b c d e",
+    "f g h b c",
+    "l m n o p q r",
+    "l m nod d d",
 ]
 
 try:
@@ -477,7 +500,11 @@ try:
 except KeyboardInterrupt:
     pass
 
-print(generate("In some systems,", 25))
-print(generate("The King", 25))
-print(generate("feudal lords", 25))
-print(generate("you peasant", 25))
+print(generate("a b", 25))
+print(generate("l m nod", 25))
+print(generate("a b c", 25))
+print(generate("l m n", 25))
+# print(generate("In some systems,", 25))
+# print(generate("The King", 25))
+# print(generate("feudal lords", 25))
+# print(generate("you peasant", 25))
