@@ -317,3 +317,167 @@ print(generate("In some systems,", 25))
 print(generate("The King", 25))
 print(generate("feudal lords", 25))
 print(generate("you peasant", 25))
+
+#############################################
+
+from torch.distributions import Categorical
+
+class PolicyNetwork(torch.nn.Module):
+    def __init__(self, model):
+        super(PolicyNetwork, self).__init__()
+        self.model = model
+
+    def forward(self, x, mask):
+        logits = self.model(x, mask)
+        return logits
+
+class ValueNetwork(torch.nn.Module):
+    def __init__(self, embedding_dim, num_tokens):
+        super(ValueNetwork, self).__init__()
+        self.fc1 = torch.nn.Linear(embedding_dim, 128)
+        self.fc2 = torch.nn.Linear(128, 1)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        value = self.fc2(x)
+        return value
+
+
+class PPO:
+    def __init__(self, policy_net, value_net, policy_lr=0.0002, value_lr=0.0001, gamma=0.999, clip_epsilon=0.1, update_epochs=10):
+        self.policy_net = policy_net
+        self.value_net = value_net
+        self.policy_optimizer = torch.optim.Adam(policy_net.parameters(), lr=policy_lr)
+        self.value_optimizer = torch.optim.Adam(value_net.parameters(), lr=value_lr)
+        self.gamma = gamma
+        self.clip_epsilon = clip_epsilon
+        self.update_epochs = update_epochs
+
+    def compute_advantages(self, rewards, values, masks):
+        advantages = []
+        returns = []
+        advantage = 0
+        return_ = 0
+        for i in reversed(range(len(rewards) - 1)):
+            return_ = rewards[i] + self.gamma * return_ * masks[i]
+            td_error = rewards[i] + self.gamma * values[i + 1] * masks[i] - values[i]
+            advantage = td_error + self.gamma * advantage * masks[i]
+            returns.insert(0, return_.clone().detach())
+            advantages.insert(0, advantage.clone().detach())
+        return advantages, returns
+
+    def update(self, trajectories):
+        states, actions, rewards, masks, old_log_probs, values = trajectories
+        advantages, returns = self.compute_advantages(rewards, values, masks)
+
+        for _ in range(self.update_epochs):
+            for state, action, mask, old_log_prob, advantage, return_ in zip(states, actions, masks, old_log_probs, advantages, returns):
+                logits = self.policy_net(state, mask)
+                dist = Categorical(logits=logits)
+                log_prob = dist.log_prob(action)
+                ratio = torch.exp(log_prob - old_log_prob)
+
+                surr1 = ratio * advantage
+                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantage
+                policy_loss = torch.min(surr1, surr2).mean() # SHOULD BE A MINUS !!!!!!!!!!!!!!!!!!!!!!!!!!!!! THERE WAS A MINUS HERE!!!!!!!!!!!!!!!!!
+
+                with torch.no_grad():
+                    embeddings = self.policy_net.model.embedding(state)
+                value = self.value_net(embeddings.squeeze(2))
+                value_loss = (return_ - value).pow(2).mean()
+
+                self.policy_optimizer.zero_grad()
+                policy_loss.backward()
+                self.policy_optimizer.step()
+
+                self.value_optimizer.zero_grad()
+                value_loss.backward()
+                self.value_optimizer.step()
+            print(f"Policy loss: {policy_loss.item()}, Value loss: {value_loss.item()}")
+
+
+def collect_trajectories(policy_net, value_net, prompts,
+                         max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS_AT_A_TIME,
+                         total_length=TOTAL_SEQUENCE_LENGTH):
+    states = []
+    actions = []
+    rewards = []
+    masks = []
+    log_probs = []
+    values = []
+
+    for prompt in prompts:
+        int_seq = tokenizer.tokenize(prompt) 
+        iterations = TOTAL_SEQUENCE_LENGTH - len(int_seq) - PREDICT_N_TOKENS_AT_A_TIME
+        cum_log_prob = 0.0
+        while iterations > 0:
+            true_seq = deepcopy(int_seq)   
+            mask = [1] * len(int_seq) + [0] * (total_length - len(int_seq))
+            if len(int_seq) < total_length:
+                int_seq += [PADDING_IDX] * (total_length - len(int_seq))
+            seq_tensor = torch.tensor([int_seq], device=device).reshape(1, len(int_seq), 1)
+            mask_tensor = torch.tensor([mask], device=device).reshape(1, len(mask), 1)
+
+            states.append(seq_tensor)
+            masks.append(mask_tensor)
+            
+            assert len(int_seq) == len(mask)
+            assert mask_tensor.view(-1)[-1] == 0
+
+            with torch.no_grad():
+                output = policy_net(seq_tensor, mask_tensor)
+
+            output = output.squeeze(0)
+            relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
+            logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
+            
+            dist = Categorical(logits=logits)
+            action = dist.sample() # TODO make it work with PREDCIT_N_TOKENS_AT_A_TIME
+            log_prob = dist.log_prob(action) # TODO make it work with PREDCIT_N_TOKENS_AT_A_TIME
+            cum_log_prob += log_prob.item() # TODO make it work with PREDCIT_N_TOKENS_AT_A_TIME
+
+            int_seq = true_seq + action.tolist()
+            
+            actions.append(action)
+            log_probs.append(log_prob.detach())
+            with torch.no_grad():
+                embeddings = policy_net.model.embedding(seq_tensor.detach()).detach()
+            values.append(value_net(embeddings.squeeze(2)))
+            iterations -= 1
+            if iterations == 0:
+                rewards.append(cum_log_prob)
+            else:
+                rewards.append(0.0)
+    
+    return states, actions, rewards, masks, log_probs, values
+
+
+policy_net = PolicyNetwork(model).to(device)
+value_net = ValueNetwork(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)
+
+# Initialize PPO
+ppo = PPO(policy_net, value_net)
+
+# Training loop
+num_epochs = 1000
+num_steps = 2048
+
+prompts = [
+    "In some systems,",
+    "The King",
+    "feudal lords",
+    "you peasant"
+]
+
+try:
+    for epoch in range(num_epochs):
+        trajectories = collect_trajectories(policy_net, value_net, prompts, num_steps)
+        ppo.update(trajectories)
+        print(f"Epoch {epoch} completed")
+except KeyboardInterrupt:
+    pass
+
+print(generate("In some systems,", 25))
+print(generate("The King", 25))
+print(generate("feudal lords", 25))
+print(generate("you peasant", 25))

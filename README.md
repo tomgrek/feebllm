@@ -10,7 +10,7 @@ Learns and generates successfully (`tokenbeam.py`) with variable length sequence
 
 * Positional embeddings may lose meaning when its possibly single tokens and possibly whole words!?!?
 * Convert the get_batch into a dataloader with pin memory.
-* Lines 123 and 114 are a bit sus
+* Lines 123 and 114 are a bit sus. Got a break point at 123 and the excerpt is too short, fix.
 
 * Add PPO
 * Change PPO to GRPO
