@@ -338,15 +338,17 @@ class ValueNetwork(torch.nn.Module):
         self.fc1 = torch.nn.Linear(embedding_dim, 128)
         self.fc2 = torch.nn.Linear(128, 1)
 
-    def forward(self, x):
+    def forward(self, x, mask):
         x = self.embedding(x)
+        x = x.squeeze(2) * mask
         x = torch.relu(self.fc1(x))
         value = self.fc2(x)
         return value
 
 
 class PPO:
-    def __init__(self, policy_net, value_net, policy_lr=0.0002, value_lr=0.0001, gamma=0.999, clip_epsilon=0.1, update_epochs=10):
+    def __init__(self, policy_net, value_net, policy_lr=0.001, value_lr=0.001, gamma=1.0, clip_epsilon=0.1, update_epochs=10):
+        """OpenAI use 1.0 for gamma"""
         self.policy_net = policy_net
         self.value_net = value_net
         self.policy_optimizer = torch.optim.Adam(policy_net.parameters(), lr=policy_lr)
@@ -372,7 +374,7 @@ class PPO:
 
             td_error = rewards[i] + self.gamma * values[i + 1].squeeze(2) - values[i].squeeze(2)
             advantage = td_error + self.gamma * advantage
-            advantages.insert(0, advantage.clone().detach())
+            advantages.insert(0, advantage)
 
         return advantages, returns
 
@@ -383,20 +385,24 @@ class PPO:
         for _ in range(self.update_epochs):
             for state, action, mask, old_log_prob, advantage, return_ in zip(states, actions, masks, old_log_probs, advantages, returns):
                 logits = self.policy_net(state, mask)
-                dist = Categorical(logits=logits)
+                
+                relevant_index = (mask == 1).nonzero(as_tuple=True)[1][-1].item() + 1
+                dist = Categorical(logits=logits[:, relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME, :])
                 log_prob = dist.log_prob(action)
                 ratio = torch.exp(log_prob - old_log_prob)
 
                 surr1 = ratio * advantage
                 surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantage
 
-                relevant_index = (mask == 1).nonzero(as_tuple=True)[1][-1].item() + 1
                 
-                policy_loss = -torch.min(surr1, surr2).mean() # SHOULD BE A MINUS !!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+                
+                policy_loss = -torch.min(surr1, surr2).mean()
 
-                value = self.value_net(state)
+                output_mask = mask.clone()
+                output_mask[:, relevant_index:relevant_index+PREDICT_N_TOKENS_AT_A_TIME, :] = 1
+                value = self.value_net(state, output_mask)
                 a = return_ - value.squeeze(2)
-                value_loss = a[:, :relevant_index + 1].pow(2).mean()
+                value_loss = a[:, :relevant_index + PREDICT_N_TOKENS_AT_A_TIME].pow(2).mean()
 
                 self.policy_optimizer.zero_grad()
                 policy_loss.backward()
@@ -410,7 +416,8 @@ class PPO:
 
 def collect_trajectories(policy_net, value_net, prompts,
                          max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS_AT_A_TIME,
-                         total_length=TOTAL_SEQUENCE_LENGTH):
+                         total_length=TOTAL_SEQUENCE_LENGTH,
+                         epsilon=0.1): # or -float("inf") for greedy
     states = []
     actions = []
     rewards = []
@@ -443,23 +450,35 @@ def collect_trajectories(policy_net, value_net, prompts,
             logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
             
             dist = Categorical(logits=logits)
-            action = dist.sample() # TODO make it work with PREDCIT_N_TOKENS_AT_A_TIME
-            log_prob = dist.log_prob(action) # TODO make it work with PREDCIT_N_TOKENS_AT_A_TIME
+            if random.random() < epsilon:
+                action = torch.tensor([random.randint(0, logits.size(-1) - 1)], device=device)
+                log_prob = torch.tensor([0.0], device=device)
+            else:
+                action = dist.sample() # TODO make it work with PREDCIT_N_TOKENS_AT_A_TIME
+                log_prob = dist.log_prob(action) # TODO make it work with PREDCIT_N_TOKENS_AT_A_TIME
+            
             cum_log_prob += log_prob.item() # TODO make it work with PREDCIT_N_TOKENS_AT_A_TIME
 
             int_seq = true_seq + action.tolist()
             
             actions.append(action)
             log_probs.append(log_prob.detach())
-            values.append(value_net(seq_tensor))#[:, :relevant_index + 1, :]).squeeze(2))
+            with torch.no_grad():
+                # TODO try running it on the updated sequence (i.e. plus action, and longer mask)?
+                # TODO should this be a scalar, e.g. just take the value at relevant_index?
+                values.append(value_net(seq_tensor, mask_tensor).detach())#[:, :relevant_index + 1, :]).squeeze(2))
             iterations -= 1
             if iterations == 0:
                 # rewards.append(cum_log_prob) # Maybe cos this is always neg I had to flip the sign.
                 seq_text = tokenizer.decode(int_seq)
-                num_ks = seq_text.count("c") * 10 / TOTAL_SEQUENCE_LENGTH
+                num_ks = seq_text.count("d") - prompt.count("d") # / TOTAL_SEQUENCE_LENGTH
                 #num_whitespaces = (TOTAL_SEQUENCE_LENGTH - seq_text.count(" ")) / TOTAL_SEQUENCE_LENGTH
                 # num_ks += 10 / abs(cum_log_prob)
-                rewards.append(num_ks)# + (num_whitespaces/100))#1.0)#num_ks)
+                num_whitespaces = seq_text.count(" ") / TOTAL_SEQUENCE_LENGTH
+                all_chars = set(seq_text)
+                unique_chars = len(all_chars) - len(set(prompt))
+                print(f"Desired chars: {num_ks} vs whitespace: {num_whitespaces} vs unique chars: {unique_chars}")
+                rewards.append(unique_chars / TOTAL_SEQUENCE_LENGTH)#num_ks - num_whitespaces + unique_chars) # + (num_whitespaces/100))#1.0)#num_ks)
             else:
                 rewards.append(0.0)
             #print("lets have a look")
@@ -484,12 +503,19 @@ num_steps = 2048
 #     "you peasant"
 # ]
 prompts = [
+    "a b",
+    "ab",
     "a b ",
     "a b c ",
+    "a b c a b",
+    "a b c a b c a b c",
     "a b c d e",
     "f g h b c",
     "l m n o p q r",
     "l m nod d d",
+    "d e f",
+    "x y z",
+    "w x y z"
 ]
 
 try:
@@ -504,6 +530,7 @@ print(generate("a b", 25))
 print(generate("l m nod", 25))
 print(generate("a b c", 25))
 print(generate("l m n", 25))
+print(generate("y z a ", 25))
 # print(generate("In some systems,", 25))
 # print(generate("The King", 25))
 # print(generate("feudal lords", 25))
