@@ -347,7 +347,7 @@ class ValueNetwork(torch.nn.Module):
 
 
 class PPO:
-    def __init__(self, policy_net, value_net, policy_lr=0.001, value_lr=0.001, gamma=1.0, clip_epsilon=0.1, update_epochs=10):
+    def __init__(self, policy_net, value_net, policy_lr=0.00005, value_lr=0.0001, gamma=1.0, clip_epsilon=0.1, update_epochs=10):
         """OpenAI use 1.0 for gamma"""
         self.policy_net = policy_net
         self.value_net = value_net
@@ -358,36 +358,39 @@ class PPO:
         self.update_epochs = update_epochs
 
     def compute_advantages(self, rewards, values, masks):
-        # Ignore masks for now since it'll always be MAX LENGTH
         advantages = []
         returns = []
-        advantage = 0
-        return_ = 0
+        #advantage = torch.zeros_like(values[0], device=device)  # Initialize advantage with the same shape as values
+        return_ = torch.zeros_like(values[0], device=device)  # Initialize return_ with the same shape as values
 
         # Initialize the last return with the last reward
-        return_ = rewards[-1]
-        returns.append(torch.tensor(return_, device=device))
+        #return_[-1] = rewards[-1]
+        returns.append(rewards[-1])
+
+        advantages.append(values[-1] - return_)  # Compute the advantage for the last step
+        #import ipdb; ipdb.set_trace()
 
         for i in reversed(range(len(rewards) - 1)):
-            return_ = rewards[i] + self.gamma * return_  # Compute the return for the current step
-            returns.insert(0, torch.tensor(return_, device=device))  # Insert at the beginning of the list
+            return_ = rewards[i] + self.gamma * returns[0]  # Compute the return for the current step
+            returns.insert(0, return_)
 
-            td_error = rewards[i] + self.gamma * values[i + 1].squeeze(2) - values[i].squeeze(2)
-            advantage = td_error + self.gamma * advantage
-            advantages.insert(0, advantage)
+            td_error = rewards[i] + self.gamma * values[i + 1] - values[i]
+            advantage = td_error + self.gamma * advantages[0]
+            advantages.insert(0, advantage)  # Do not detach the advantage
 
         return advantages, returns
 
     def update(self, trajectories):
         states, actions, rewards, masks, old_log_probs, values = trajectories
         advantages, returns = self.compute_advantages(rewards, values, masks)
+        #import ipdb; ipdb.set_trace()
 
         for _ in range(self.update_epochs):
             for state, action, mask, old_log_prob, advantage, return_ in zip(states, actions, masks, old_log_probs, advantages, returns):
                 logits = self.policy_net(state, mask)
                 
                 relevant_index = (mask == 1).nonzero(as_tuple=True)[1][-1].item() + 1
-                dist = Categorical(logits=logits[:, relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME, :])
+                dist = Categorical(logits=logits)#[:, relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME, :]) RECENT CHANGE
                 log_prob = dist.log_prob(action)
                 ratio = torch.exp(log_prob - old_log_prob)
 
@@ -398,11 +401,14 @@ class PPO:
                 
                 policy_loss = -torch.min(surr1, surr2).mean()
 
+                value = self.value_net(state, mask)
+                value = value.squeeze(2)
+
                 output_mask = mask.clone()
                 output_mask[:, relevant_index:relevant_index+PREDICT_N_TOKENS_AT_A_TIME, :] = 1
-                value = self.value_net(state, output_mask)
-                a = return_ - value.squeeze(2)
-                value_loss = a[:, :relevant_index + PREDICT_N_TOKENS_AT_A_TIME].pow(2).mean()
+
+                valid_indices = output_mask.squeeze(2) == 1  # Get indices of valid (non-padding) tokens
+                value_loss = (return_ - value).pow(2).mean()#(return_[valid_indices] - value[valid_indices]).pow(2).mean()
 
                 self.policy_optimizer.zero_grad()
                 policy_loss.backward()
@@ -417,7 +423,7 @@ class PPO:
 def collect_trajectories(policy_net, value_net, prompts,
                          max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS_AT_A_TIME,
                          total_length=TOTAL_SEQUENCE_LENGTH,
-                         epsilon=0.1): # or -float("inf") for greedy
+                         epsilon=0.3):#-float("inf")): # or -float("inf") for greedy
     states = []
     actions = []
     rewards = []
@@ -425,7 +431,7 @@ def collect_trajectories(policy_net, value_net, prompts,
     log_probs = []
     values = []
 
-    for prompt in prompts:#[:1]:
+    for prompt in prompts[:1]:
         int_seq = tokenizer.tokenize(prompt) 
         iterations = TOTAL_SEQUENCE_LENGTH - len(int_seq) - PREDICT_N_TOKENS_AT_A_TIME # Predict a long sequence as rewards flow back
         cum_log_prob = 0.0
@@ -450,39 +456,54 @@ def collect_trajectories(policy_net, value_net, prompts,
             logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
             
             dist = Categorical(logits=logits)
+
             if random.random() < epsilon:
-                action = torch.tensor([random.randint(0, logits.size(-1) - 1)], device=device)
-                log_prob = torch.tensor([0.0], device=device)
+                if random.random() < 0.3:
+                    action = torch.tensor([27], device=device) ################### LOTS OF qs
+                else:
+                    action = torch.tensor([random.randint(0, logits.size(-1) - 1)], device=device)
+                log_prob = torch.tensor([0.0], device=device)#dist.log_prob(action)#
             else:
-                action = dist.sample() # TODO make it work with PREDCIT_N_TOKENS_AT_A_TIME
+                action = dist.sample()
+                # while action.item() == 1:
+                #     action = dist.sample() # TODO make it work with PREDCIT_N_TOKENS_AT_A_TIME
                 log_prob = dist.log_prob(action) # TODO make it work with PREDCIT_N_TOKENS_AT_A_TIME
             
             cum_log_prob += log_prob.item() # TODO make it work with PREDCIT_N_TOKENS_AT_A_TIME
+            print(f"Chosen action ({action.item()}): {tokenizer.decode([action.item()])}, log prob: {log_prob.item()}")
 
             int_seq = true_seq + action.tolist()
             
             actions.append(action)
             log_probs.append(log_prob.detach())
             with torch.no_grad():
+                # NOPE use the same inputs as to the policy network.
+                # seq_tensor[0, relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME, :] = action
+                # mask_tensor[0, relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME, :] = 1
                 # TODO try running it on the updated sequence (i.e. plus action, and longer mask)?
                 # TODO should this be a scalar, e.g. just take the value at relevant_index?
-                values.append(value_net(seq_tensor, mask_tensor).detach())#[:, :relevant_index + 1, :]).squeeze(2))
+                value = value_net(seq_tensor, mask_tensor).detach()
+                values.append(value.flatten()[-1])#[:, :relevant_index + PREDICT_N_TOKENS_AT_A_TIME, :])
             iterations -= 1
             if iterations == 0:
                 # rewards.append(cum_log_prob) # Maybe cos this is always neg I had to flip the sign.
                 seq_text = tokenizer.decode(int_seq)
-                num_ks = seq_text.count("d") - prompt.count("d") # / TOTAL_SEQUENCE_LENGTH
+                num_ks = seq_text.count("y") - prompt.count("y") # / TOTAL_SEQUENCE_LENGTH
                 #num_whitespaces = (TOTAL_SEQUENCE_LENGTH - seq_text.count(" ")) / TOTAL_SEQUENCE_LENGTH
                 # num_ks += 10 / abs(cum_log_prob)
-                num_whitespaces = seq_text.count(" ") / TOTAL_SEQUENCE_LENGTH
+                num_whitespaces = (seq_text.count(" ") + seq_text.count("\n")) / TOTAL_SEQUENCE_LENGTH
                 all_chars = set(seq_text)
-                unique_chars = len(all_chars) - len(set(prompt))
+                unique_chars = len(all_chars) #- len(set(prompt))
                 print(f"Desired chars: {num_ks} vs whitespace: {num_whitespaces} vs unique chars: {unique_chars}")
-                rewards.append(unique_chars / TOTAL_SEQUENCE_LENGTH)#num_ks - num_whitespaces + unique_chars) # + (num_whitespaces/100))#1.0)#num_ks)
+                rewards.append(num_ks - num_whitespaces)#num_ks - num_whitespaces + unique_chars) # + (num_whitespaces/100))#1.0)#num_ks)
             else:
                 rewards.append(0.0)
-            #print("lets have a look")
-    
+    # states: len(generation) list of BxTxN tensors (the inputs, without any predicted tokens, padded to max length (1x20x1))
+    # actions: len(generation) list of [1] tensors (the predicted token)
+    # rewards: len(generation) list of floats - only the final one is non zero
+    # masks: len(generation) list of BxTx1 tensors (1 for real tokens that are in the matching state, 0 otherwise)
+    # log_probs: len(generation) list of [1] tensors
+    # values: len(generation) list of BxTx1 tensors. The real ones, corresponding to the non-zero mask/input state, are different. After that (padding) they are same.
     return states, actions, rewards, masks, log_probs, values
 
 
@@ -503,6 +524,7 @@ num_steps = 2048
 #     "you peasant"
 # ]
 prompts = [
+    "a b ",
     "a b",
     "ab",
     "a b ",
