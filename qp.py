@@ -409,7 +409,7 @@ class PPO:
                 policy_loss = -torch.min(surr1, surr2).mean()
 
                 value = self.value_net(state, mask)
-                value = value.squeeze(2)
+                value = value[:, -1, :]#.squeeze(2)
 
                 output_mask = mask.clone()
                 output_mask[:, relevant_index:relevant_index+PREDICT_N_TOKENS_AT_A_TIME, :] = 1
@@ -492,7 +492,7 @@ def collect_trajectories(policy_net, value_net, prompts,
                 all_chars = set(seq_text)
                 unique_chars = len(all_chars) - len(set(prompt))
                 #reward = good_chars - (0.3*bad_chars) + (num_whitespaces / (0.5*TOTAL_SEQUENCE_LENGTH))
-                reward = num_whitespaces
+                reward = -num_whitespaces
                 print(f"---> Desired chars: {good_chars} vs whitespace: {num_whitespaces} vs unique chars: {unique_chars} ------ Reward: {reward}")
                 rewards.append(reward)
             else:

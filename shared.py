@@ -242,7 +242,7 @@ examples = generate_data(10000, max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS
 model = Model(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)
 model.train()
 try:
-    train(model, examples, epochs=10000, early_stop=0.01)
+    train(model, examples, epochs=10000, early_stop=0.2)
 except KeyboardInterrupt:
     pass
 model.eval()
@@ -364,21 +364,18 @@ class PPO:
         advantages = []
         returns = []
         rewards = self.normalize(rewards)
-        #advantage = torch.zeros_like(values[0], device=device)  # Initialize advantage with the same shape as values
         return_ = torch.zeros_like(values[0], device=device)  # Initialize return_ with the same shape as values
 
         # Initialize the last return with the last reward
-        #return_[-1] = rewards[-1]
-        returns.append(rewards[-1])
-
-        advantages.append(values[-1] - return_)
+        return_ = torch.tensor(rewards[-1]).to(device)
+        returns.append(return_.clone().detach())
 
         for i in reversed(range(len(rewards) - 1)):
-            return_ = rewards[i] + self.gamma * returns[0]  # Compute the return for the current step
-            returns.insert(0, return_)
+            return_ = rewards[i] + self.gamma * return_  # Compute the return for the current step
+            returns.insert(0, return_.clone().detach())  # Insert at the beginning of the list and detach
 
             td_error = rewards[i] + self.gamma * values[i + 1] - values[i]
-            advantage = td_error + self.gamma * advantages[0]
+            advantage = td_error + self.gamma * advantages[0] if advantages else td_error
             advantages.insert(0, advantage)  # Do not detach the advantage
 
         return advantages, returns
@@ -386,11 +383,10 @@ class PPO:
     def update(self, trajectories):
         states, actions, rewards, masks, old_log_probs, values = trajectories
         advantages, returns = self.compute_advantages(rewards, values, masks)
-        #import ipdb; ipdb.set_trace()
 
         for _ in range(self.update_epochs):
             for state, action, mask, old_log_prob, advantage, return_ in zip(states, actions, masks, old_log_probs, advantages, returns):
-                logits, value = self.net(state, mask)
+                logits = self.policy_net(state, mask)
                 
                 relevant_index = (mask == 1).nonzero(as_tuple=True)[1][-1].item() + 1
                 dist = Categorical(logits=logits[:, relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME, :]) #RECENT CHANGE
@@ -401,28 +397,19 @@ class PPO:
                 surr1 = ratio * advantage
                 surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantage
 
-                
-                
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                #value = self.value_net(state, mask)
-                value = value.squeeze(2)
+                value = self.value_net(state, mask)
+                value = value[:, -1, :]#value.squeeze(2)
 
-                output_mask = mask.clone()
-                output_mask[:, relevant_index:relevant_index+PREDICT_N_TOKENS_AT_A_TIME, :] = 1
-
-                valid_indices = output_mask.squeeze(2) == 1  # Get indices of valid (non-padding) tokens
-                value_loss = (return_ - value).pow(2).mean()#(return_[valid_indices] - value[valid_indices]).pow(2).mean()
-
-                
+                value_loss = (return_ - value).pow(2).mean()
 
                 self.value_optimizer.zero_grad()
                 value_loss.backward(retain_graph=True)
-                
+                self.value_optimizer.step()
 
                 self.policy_optimizer.zero_grad()
-                policy_loss.backward(retain_graph=True)
-                self.value_optimizer.step()
+                policy_loss.backward()
                 self.policy_optimizer.step()
 
             print(f"Policy loss: {policy_loss.item()}, Value loss: {value_loss.item()}")
@@ -458,7 +445,8 @@ def collect_trajectories(net, policy_net, value_net, prompts,
             assert len(int_seq) == len(mask)
             assert mask_tensor.view(-1)[-1] == 0
 
-            output, value = net(seq_tensor, mask_tensor)
+            with torch.no_grad():
+                output, value = net(seq_tensor, mask_tensor)
 
             output = output.squeeze(0)  # This chops off the batch dimension??????????
             relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
@@ -481,7 +469,7 @@ def collect_trajectories(net, policy_net, value_net, prompts,
             log_probs.append(log_prob.detach())
             # with torch.no_grad():
             #     value = value_net(seq_tensor, mask_tensor).detach()
-            values.append(value.flatten()[-1])
+            values.append(value.detach().flatten()[-1])
             iterations -= 1
             seq_text = tokenizer.decode(int_seq)
             good_chars = seq_text.count("c") - prompt.count("c") / (TOTAL_SEQUENCE_LENGTH/2)
@@ -492,7 +480,7 @@ def collect_trajectories(net, policy_net, value_net, prompts,
                 num_whitespaces = (seq_text.count(" ") + seq_text.count("\n")) #/ TOTAL_SEQUENCE_LENGTH
                 all_chars = set(seq_text)
                 unique_chars = len(all_chars) - len(set(prompt))
-                reward = good_chars - (0.3*bad_chars) + (num_whitespaces / (0.5*TOTAL_SEQUENCE_LENGTH))
+                reward = num_whitespaces #good_chars - (0.3*bad_chars) + (num_whitespaces / (0.5*TOTAL_SEQUENCE_LENGTH))
                 print(f"---> Desired chars: {good_chars} vs whitespace: {num_whitespaces} vs unique chars: {unique_chars} ------ Reward: {reward}")
                 rewards.append(reward)
             else:
@@ -542,13 +530,14 @@ prompts = [
     "z\na b c d"
 ]
 
-try:
-    for epoch in range(num_epochs):
-        trajectories = collect_trajectories(model, policy_net, value_net, prompts, num_steps)
-        ppo.update(trajectories)
-        print(f"Epoch {epoch} completed")
-except KeyboardInterrupt:
-    pass
+with torch.autograd.set_detect_anomaly(True):
+    try:
+        for epoch in range(num_epochs):
+            trajectories = collect_trajectories(model, policy_net, value_net, prompts, num_steps)
+            ppo.update(trajectories)
+            print(f"Epoch {epoch} completed")
+    except KeyboardInterrupt:
+        pass
 
 for p in prompts:
     print(generate(p, 25))
