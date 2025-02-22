@@ -349,7 +349,7 @@ class PPO:
         self.value_net = value_net
         self.net = net
         self.policy_optimizer = torch.optim.Adam(policy_net.parameters(), lr=policy_lr)
-        self.value_optimizer = torch.optim.Adam(value_net.parameters(), lr=value_lr)
+        self.value_optimizer = torch.optim.Adam(value_net.model.value_head.parameters(), lr=value_lr)
         self.gamma = gamma
         self.clip_epsilon = clip_epsilon
         self.update_epochs = update_epochs
@@ -368,11 +368,11 @@ class PPO:
 
         # Initialize the last return with the last reward
         return_ = torch.tensor(rewards[-1]).to(device)
-        returns.append(return_.clone().detach())
+        returns.append(return_)
 
         for i in reversed(range(len(rewards) - 1)):
             return_ = rewards[i] + self.gamma * return_  # Compute the return for the current step
-            returns.insert(0, return_.clone().detach())  # Insert at the beginning of the list and detach
+            returns.insert(0, return_)  # Insert at the beginning of the list and detach
 
             td_error = rewards[i] + self.gamma * values[i + 1] - values[i]
             advantage = td_error + self.gamma * advantages[0] if advantages else td_error
@@ -400,12 +400,12 @@ class PPO:
                 policy_loss = -torch.min(surr1, surr2).mean()
 
                 value = self.value_net(state, mask)
-                value = value[:, -1, :]#value.squeeze(2)
+                value_ = value[:, -1, :]
 
-                value_loss = (return_ - value).pow(2).mean()
+                value_loss = (return_ - value_).pow(2).mean()
 
                 self.value_optimizer.zero_grad()
-                value_loss.backward(retain_graph=True)
+                value_loss.backward()
                 self.value_optimizer.step()
 
                 self.policy_optimizer.zero_grad()
@@ -466,10 +466,10 @@ def collect_trajectories(net, policy_net, value_net, prompts,
             int_seq = true_seq + action.tolist()
             
             actions.append(action)
-            log_probs.append(log_prob.detach())
+            log_probs.append(log_prob)
             # with torch.no_grad():
             #     value = value_net(seq_tensor, mask_tensor).detach()
-            values.append(value.detach().flatten()[-1])
+            values.append(value.flatten()[-1])
             iterations -= 1
             seq_text = tokenizer.decode(int_seq)
             good_chars = seq_text.count("c") - prompt.count("c") / (TOTAL_SEQUENCE_LENGTH/2)
