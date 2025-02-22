@@ -189,6 +189,7 @@ class Model(torch.nn.Module):
         self.fc = torch.nn.Linear(embedding_dim, num_tokens)
         self.dropout = torch.nn.Dropout(0.1)
         self.layer_norm = torch.nn.LayerNorm(embedding_dim)
+        self.value_head = torch.nn.Linear(embedding_dim, 1)
 
     def forward(self, x, mask):
         seq_length = x.size(1)
@@ -203,8 +204,9 @@ class Model(torch.nn.Module):
         
         x = self.layer_norm(x)
         x = self.dropout(x)
-        x = self.fc(x)
-        return x
+        policy_logits = self.fc(x)
+        value = self.value_head(x)
+        return policy_logits, value
 
 def train(model, data, epochs=20, early_stop=-float("inf")):
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.002, weight_decay=0.01)
@@ -217,7 +219,7 @@ def train(model, data, epochs=20, early_stop=-float("inf")):
             mini_batch_size = BATCH_SIZE
         datas = [get_batch(data, bs=mini_batch_size) for _ in range(len(data) // BATCH_SIZE)]
         for seq, target, input_mask, output_mask in datas:
-            output = model(seq, input_mask)
+            output, _ = model(seq, input_mask)
             
             loss = torch.nn.functional.cross_entropy(output.permute(0, 2, 1), target, reduction='none')
             
@@ -240,7 +242,7 @@ examples = generate_data(10000, max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS
 model = Model(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)
 model.train()
 try:
-    train(model, examples, epochs=10000, early_stop=0.1)  # Harder to train PPO once it's overfit
+    train(model, examples, epochs=10000, early_stop=0.01)
 except KeyboardInterrupt:
     pass
 model.eval()
@@ -252,7 +254,7 @@ total_correct = 0
 
 for i in range(num_eval):
     seq, target, input_mask, output_mask = get_batch(eval_examples, bs=1)
-    output = model(seq, input_mask)
+    output, _ = model(seq, input_mask)
     output = output.squeeze(0)
     relevant_index = (output_mask == 1).nonzero(as_tuple=True)[1][0].item()
     
@@ -293,7 +295,7 @@ def generate(prompt, iterations=3,
             assert mask_tensor.view(-1)[-1] == 0
 
             with torch.no_grad():
-                output = model(seq_tensor, mask_tensor)
+                output, _ = model(seq_tensor, mask_tensor)
             output = output.squeeze(0)
             relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
             logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
@@ -328,28 +330,24 @@ class PolicyNetwork(torch.nn.Module):
         self.model = model
 
     def forward(self, x, mask):
-        logits = self.model(x, mask)
+        logits, _ = self.model(x, mask)
         return logits
 
 class ValueNetwork(torch.nn.Module):
-    def __init__(self, embedding_dim, num_tokens):
+    def __init__(self, model):
         super(ValueNetwork, self).__init__()
-        self.embedding = torch.nn.Embedding(num_tokens, embedding_dim)
-        self.fc1 = torch.nn.Linear(embedding_dim, 128)
-        self.fc2 = torch.nn.Linear(128, 1)
+        self.model = model
 
     def forward(self, x, mask):
-        x = self.embedding(x)
-        x = x.squeeze(2) * mask
-        x = torch.relu(self.fc1(x))
-        value = self.fc2(x)
+        _, value = self.model(x, mask)
         return value
 
 
 class PPO:
-    def __init__(self, policy_net, value_net, policy_lr=0.0003, value_lr=0.0001, gamma=1.0, clip_epsilon=0.3, update_epochs=10):
+    def __init__(self, net, policy_net, value_net, policy_lr=0.00005, value_lr=0.0001, gamma=0.999, clip_epsilon=0.3, update_epochs=10):
         self.policy_net = policy_net
         self.value_net = value_net
+        self.net = net
         self.policy_optimizer = torch.optim.Adam(policy_net.parameters(), lr=policy_lr)
         self.value_optimizer = torch.optim.Adam(value_net.parameters(), lr=value_lr)
         self.gamma = gamma
@@ -373,8 +371,7 @@ class PPO:
         #return_[-1] = rewards[-1]
         returns.append(rewards[-1])
 
-        advantages.append(values[-1] - return_)  # Compute the advantage for the last step
-        #import ipdb; ipdb.set_trace()
+        advantages.append(values[-1] - return_)
 
         for i in reversed(range(len(rewards) - 1)):
             return_ = rewards[i] + self.gamma * returns[0]  # Compute the return for the current step
@@ -393,7 +390,7 @@ class PPO:
 
         for _ in range(self.update_epochs):
             for state, action, mask, old_log_prob, advantage, return_ in zip(states, actions, masks, old_log_probs, advantages, returns):
-                logits = self.policy_net(state, mask)
+                logits, value = self.net(state, mask)
                 
                 relevant_index = (mask == 1).nonzero(as_tuple=True)[1][-1].item() + 1
                 dist = Categorical(logits=logits[:, relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME, :]) #RECENT CHANGE
@@ -408,7 +405,7 @@ class PPO:
                 
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                value = self.value_net(state, mask)
+                #value = self.value_net(state, mask)
                 value = value.squeeze(2)
 
                 output_mask = mask.clone()
@@ -417,17 +414,21 @@ class PPO:
                 valid_indices = output_mask.squeeze(2) == 1  # Get indices of valid (non-padding) tokens
                 value_loss = (return_ - value).pow(2).mean()#(return_[valid_indices] - value[valid_indices]).pow(2).mean()
 
-                self.policy_optimizer.zero_grad()
-                policy_loss.backward()
-                self.policy_optimizer.step()
+                
 
                 self.value_optimizer.zero_grad()
-                value_loss.backward()
+                value_loss.backward(retain_graph=True)
+                
+
+                self.policy_optimizer.zero_grad()
+                policy_loss.backward(retain_graph=True)
                 self.value_optimizer.step()
+                self.policy_optimizer.step()
+
             print(f"Policy loss: {policy_loss.item()}, Value loss: {value_loss.item()}")
 
 
-def collect_trajectories(policy_net, value_net, prompts,
+def collect_trajectories(net, policy_net, value_net, prompts,
                          max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS_AT_A_TIME,
                          total_length=TOTAL_SEQUENCE_LENGTH,
                          epsilon=-float("inf")):
@@ -457,7 +458,7 @@ def collect_trajectories(policy_net, value_net, prompts,
             assert len(int_seq) == len(mask)
             assert mask_tensor.view(-1)[-1] == 0
 
-            output = policy_net(seq_tensor, mask_tensor)
+            output, value = net(seq_tensor, mask_tensor)
 
             output = output.squeeze(0)  # This chops off the batch dimension??????????
             relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
@@ -478,9 +479,9 @@ def collect_trajectories(policy_net, value_net, prompts,
             
             actions.append(action)
             log_probs.append(log_prob.detach())
-            with torch.no_grad():
-                value = value_net(seq_tensor, mask_tensor).detach()
-                values.append(value.flatten()[-1])
+            # with torch.no_grad():
+            #     value = value_net(seq_tensor, mask_tensor).detach()
+            values.append(value.flatten()[-1])
             iterations -= 1
             seq_text = tokenizer.decode(int_seq)
             good_chars = seq_text.count("c") - prompt.count("c") / (TOTAL_SEQUENCE_LENGTH/2)
@@ -491,8 +492,7 @@ def collect_trajectories(policy_net, value_net, prompts,
                 num_whitespaces = (seq_text.count(" ") + seq_text.count("\n")) #/ TOTAL_SEQUENCE_LENGTH
                 all_chars = set(seq_text)
                 unique_chars = len(all_chars) - len(set(prompt))
-                #reward = good_chars - (0.3*bad_chars) + (num_whitespaces / (0.5*TOTAL_SEQUENCE_LENGTH))
-                reward = num_whitespaces
+                reward = good_chars - (0.3*bad_chars) + (num_whitespaces / (0.5*TOTAL_SEQUENCE_LENGTH))
                 print(f"---> Desired chars: {good_chars} vs whitespace: {num_whitespaces} vs unique chars: {unique_chars} ------ Reward: {reward}")
                 rewards.append(reward)
             else:
@@ -504,10 +504,10 @@ def collect_trajectories(policy_net, value_net, prompts,
 
 
 policy_net = PolicyNetwork(model).to(device)
-value_net = ValueNetwork(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)
+value_net = ValueNetwork(model).to(device)
 
 # Initialize PPO
-ppo = PPO(policy_net, value_net)
+ppo = PPO(model, policy_net, value_net)
 
 # Training loop
 num_epochs = 1000
@@ -544,7 +544,7 @@ prompts = [
 
 try:
     for epoch in range(num_epochs):
-        trajectories = collect_trajectories(policy_net, value_net, prompts, num_steps)
+        trajectories = collect_trajectories(model, policy_net, value_net, prompts, num_steps)
         ppo.update(trajectories)
         print(f"Epoch {epoch} completed")
 except KeyboardInterrupt:
