@@ -15,6 +15,7 @@ TOTAL_SEQUENCE_LENGTH = 20
 PREDICT_N_TOKENS_AT_A_TIME = 1
 MAX_VOCAB_SIZE = 29 # Must be <= number of tokens in the corpus
 BATCH_SIZE = 128  # Max, will use smaller batches sometimes
+TEMPERATURE = 1.1
 
 corpus = """
 a b c d e f g h i j k l m n o p q r s t u v w x y z
@@ -350,7 +351,7 @@ class ValueNetwork(torch.nn.Module):
 
 
 class PPO:
-    def __init__(self, policy_net, value_net, policy_lr=0.0003, value_lr=0.0001, gamma=1.0, clip_epsilon=0.3, update_epochs=10):
+    def __init__(self, policy_net, value_net, policy_lr=0.0001, value_lr=0.0001, gamma=0.99, clip_epsilon=0.2, update_epochs=10):
         self.policy_net = policy_net
         self.value_net = value_net
         self.policy_optimizer = torch.optim.Adam(policy_net.parameters(), lr=policy_lr)
@@ -360,7 +361,6 @@ class PPO:
         self.update_epochs = update_epochs
     
     def normalize(self, tensor):
-        return tensor
         tensor = torch.tensor(tensor, device=device)
         mean = tensor.mean()
         std = tensor.std()
@@ -369,25 +369,28 @@ class PPO:
     def compute_advantages(self, rewards, values, masks):
         advantages = []
         returns = []
-        rewards = self.normalize(rewards)
+        # rewards2 = self.normalize(rewards) # This turns all the rewards negative except the last!
+        rewards2 = rewards
+        # import ipdb; ipdb.set_trace()
         #advantage = torch.zeros_like(values[0], device=device)  # Initialize advantage with the same shape as values
         return_ = torch.zeros_like(values[0], device=device)  # Initialize return_ with the same shape as values
 
         # Initialize the last return with the last reward
         #return_[-1] = rewards[-1]
-        returns.append(rewards[-1])
+        returns.append(rewards2[-1])
 
         advantages.append(values[-1] - return_)  # Compute the advantage for the last step
         #import ipdb; ipdb.set_trace()
 
-        for i in reversed(range(len(rewards) - 1)):
-            return_ = rewards[i] + self.gamma * returns[0]  # Compute the return for the current step
+        for i in reversed(range(len(rewards2) - 1)):
+            return_ = rewards2[i] + self.gamma * returns[0]  # Compute the return for the current step
             returns.insert(0, return_)
 
-            td_error = rewards[i] + self.gamma * values[i + 1] - values[i]
+            td_error = rewards2[i] + self.gamma * values[i + 1] - values[i]
             advantage = td_error + self.gamma * advantages[0]
             advantages.insert(0, advantage)  # Do not detach the advantage
 
+        #import ipdb; ipdb.set_trace()
         return advantages, returns
 
     def update(self, trajectories):
@@ -396,14 +399,13 @@ class PPO:
         #import ipdb; ipdb.set_trace()
 
         for _ in range(self.update_epochs):
-            total_policy_loss = None
-            total_value_loss = None
-
             for state, action, mask, old_log_prob, advantage, return_ in zip(states, actions, masks, old_log_probs, advantages, returns):
                 logits = self.policy_net(state, mask)
                 
                 relevant_index = (mask == 1).nonzero(as_tuple=True)[1][-1].item() + 1
-                dist = Categorical(logits=logits[:, relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME, :]) #RECENT CHANGE
+                these_logits = logits[:, relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME, :]
+                dist = Categorical(logits=these_logits/TEMPERATURE)
+                #import ipdb; ipdb.set_trace()
                 log_prob = dist.log_prob(action).view_as(old_log_prob)
                 
                 ratio = torch.exp(log_prob - old_log_prob)
@@ -413,19 +415,18 @@ class PPO:
 
                 
                 
-                policy_loss = torch.min(surr1, surr2).mean()
-                # if policy_loss.item() < 0:
-                #     print(f"Negative policy loss: {policy_loss.item()}")
-                #     continue
+                policy_loss = -torch.min(surr1, surr2).mean()
 
                 value = self.value_net(state, mask)
-                value = value[:, -1, :]#.squeeze(2)
+                value = value.flatten().mean()#[:, -1, :]#.squeeze(2)
 
                 output_mask = mask.clone()
                 output_mask[:, relevant_index:relevant_index+PREDICT_N_TOKENS_AT_A_TIME, :] = 1
 
+                
                 valid_indices = output_mask.squeeze(2) == 1  # Get indices of valid (non-padding) tokens
                 value_loss = (return_ - value).pow(2).mean()#(return_[valid_indices] - value[valid_indices]).pow(2).mean()
+                #print(f"Return: {return_}, Predicted Value: {value} --- Value loss: {value_loss}")
 
                 self.policy_optimizer.zero_grad()
                 policy_loss.backward()
@@ -434,15 +435,7 @@ class PPO:
                 self.value_optimizer.zero_grad()
                 value_loss.backward()
                 self.value_optimizer.step()
-
-                if total_policy_loss is None:
-                    total_policy_loss = policy_loss
-                    total_value_loss = value_loss
-                else:
-                    total_policy_loss += policy_loss
-                    total_value_loss += value_loss
-            
-            print(f"Policy loss: {total_policy_loss.item()}, Value loss: {total_value_loss.item()}")
+            print(f"Policy loss: {policy_loss.item()}, Value loss: {value_loss.item()}")
 
 
 def collect_trajectories(policy_net, value_net, prompts,
@@ -481,7 +474,8 @@ def collect_trajectories(policy_net, value_net, prompts,
             relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
             logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
             
-            dist = Categorical(logits=logits)
+            whitened_logits = logits / TEMPERATURE  # temperature > 1 makes it more uniform, < 1 makes it more peaky
+            dist = Categorical(logits=whitened_logits)
 
             if random.random() < epsilon:
                 action = torch.tensor([random.randint(0, logits.size(-1) - 1)], device=device)
@@ -498,11 +492,11 @@ def collect_trajectories(policy_net, value_net, prompts,
             log_probs.append(log_prob.detach())
             with torch.no_grad():
                 value = value_net(seq_tensor, mask_tensor).detach()
-                values.append(value.flatten()[-1])
+                values.append(value.flatten().mean())
             iterations -= 1
             seq_text = tokenizer.decode(int_seq)
-            good_chars = seq_text.count("d") - prompt.count("d") #/ (TOTAL_SEQUENCE_LENGTH/2)
-            bad_chars = seq_text.count("h") - prompt.count("h")# / TOTAL_SEQUENCE_LENGTH
+            good_chars = seq_text.count("c") - prompt.count("c") / (TOTAL_SEQUENCE_LENGTH/2)
+            bad_chars = seq_text.count("h") - prompt.count("h") / TOTAL_SEQUENCE_LENGTH
             if iterations == 0:
                 
                 
@@ -510,10 +504,9 @@ def collect_trajectories(policy_net, value_net, prompts,
                 all_chars = set(seq_text)
                 unique_chars = len(all_chars) - len(set(prompt))
                 #reward = good_chars - (0.3*bad_chars) + (num_whitespaces / (0.5*TOTAL_SEQUENCE_LENGTH))
-                reward = good_chars + num_whitespaces * 1.1#good_chars - (bad_chars/2)#* 4 + num_whitespaces / 5
+                reward = num_whitespaces #22-
                 print(f"---> Desired chars: {good_chars} vs whitespace: {num_whitespaces} vs unique chars: {unique_chars} ------ Reward: {reward}")
-                assert reward >= 0
-                rewards.append((reward)/100) # USE 30-reward to make it neg! So it still pos!
+                rewards.append(reward)
             else:
                 rewards.append(0.0)#0.01 * int(good_chars > bad_chars))#rewards.append(0.0)
             
@@ -526,7 +519,7 @@ policy_net = PolicyNetwork(model).to(device)
 value_net = ValueNetwork(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)
 
 # Initialize PPO
-ppo = PPO(policy_net, value_net, update_epochs=20)
+ppo = PPO(policy_net, value_net, update_epochs=30)
 
 # Training loop
 num_epochs = 1000
@@ -540,27 +533,28 @@ num_steps = 2048
 # ]
 prompts = [
     "a",
-    "a b ",
-    "a b",
-    "ab",
-    "b c d ",
-    "b c d e ",
-    "a b c d e",
-    "c d e ",
-    "a b c d e ",
+    # "a b ",
+    # "a b",
+    # "ab",
+    # "b c d ",
+    # "b c d e ",
+    # "a b c d e",
+    # "c d e ",
+    # "a b c d e ",
     # "a b c a b",
     # "a b c a b c a b c",
-    "a b c d e",
+    # "a b c d e",
     # "f g h b c",
     # "l m n o p q r",
     # "l m nod d d",
     # "d e f",
-    "x y z",
-    "w x y z",
-    "w x y z\na b",
-    "z\na b c d"
+    # "x y z",
+    # "w x y z",
+    # "w x y z\na b c",
+    # "z\na b c d"
 ]
 
+num_epochs = 100
 try:
     for epoch in range(num_epochs):
         trajectories = collect_trajectories(policy_net, value_net, prompts, num_steps)
