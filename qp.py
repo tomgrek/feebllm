@@ -324,6 +324,8 @@ print(generate("l m n o", 25))
 
 #############################################
 
+model.train()
+
 from torch.distributions import Categorical
 
 class PolicyNetwork(torch.nn.Module):
@@ -379,8 +381,7 @@ class PPO:
         #return_[-1] = rewards[-1]
         returns.append(rewards2[-1])
 
-        advantages.append(values[-1] - return_)  # Compute the advantage for the last step
-        #import ipdb; ipdb.set_trace()
+        advantages.append(values[-1] - return_)
 
         for i in reversed(range(len(rewards2) - 1)):
             return_ = rewards2[i] + self.gamma * returns[0]  # Compute the return for the current step
@@ -388,15 +389,13 @@ class PPO:
 
             td_error = rewards2[i] + self.gamma * values[i + 1] - values[i]
             advantage = td_error + self.gamma * advantages[0]
-            advantages.insert(0, advantage)  # Do not detach the advantage
+            advantages.insert(0, advantage)
 
-        #import ipdb; ipdb.set_trace()
         return advantages, returns
 
     def update(self, trajectories):
         states, actions, rewards, masks, old_log_probs, values = trajectories
         advantages, returns = self.compute_advantages(rewards, values, masks)
-        #import ipdb; ipdb.set_trace()
 
         for _ in range(self.update_epochs):
             for state, action, mask, old_log_prob, advantage, return_ in zip(states, actions, masks, old_log_probs, advantages, returns):
@@ -412,8 +411,6 @@ class PPO:
 
                 surr1 = ratio * advantage
                 surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantage
-
-                
                 
                 policy_loss = -torch.min(surr1, surr2).mean()
 
@@ -515,12 +512,13 @@ def collect_trajectories(policy_net, value_net, prompts,
             avg_reward += rewards[-1]
     avg_reward /= len(prompts)
     print(f"Average reward: {avg_reward}")
-    if avg_reward > 0.0:
-        # HUH? rewards = [r - avg_reward for r in rewards]
+    if avg_reward > 4.0:
         newtemp = TEMPERATURE * 0.9
-    elif avg_reward < 0.0:
+    elif avg_reward < 2.0:
         newtemp = TEMPERATURE * 1.1
-    TEMPERATURE = max(0.9, min(10.0, newtemp))
+    else:
+        newtemp = TEMPERATURE
+    TEMPERATURE = max(0.9, min(4.0, newtemp))
     print(f"Temperature: {TEMPERATURE}")
 
     return states, actions, rewards, masks, log_probs, values
@@ -529,19 +527,8 @@ def collect_trajectories(policy_net, value_net, prompts,
 policy_net = PolicyNetwork(model).to(device)
 value_net = ValueNetwork(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)
 
-# Initialize PPO
 ppo = PPO(policy_net, value_net, update_epochs=10)
 
-# Training loop
-num_epochs = 1000
-num_steps = 2048
-
-# prompts = [
-#     "In some systems,",
-#     "The King",
-#     "feudal lords",
-#     "you peasant"
-# ]
 prompts = [
     "a",
     "a b ",
@@ -561,11 +548,13 @@ prompts = [
     # "d e f",
     "x y z",
     "w x y z",
+    "r s t u v",
     # "w x y z\na b c",
     # "z\na b c d"
 ]
 
 num_epochs = 100
+num_steps = 2048
 try:
     for epoch in range(num_epochs):
         trajectories = collect_trajectories(policy_net, value_net, prompts, num_steps)
