@@ -15,7 +15,7 @@ TOTAL_SEQUENCE_LENGTH = 20
 PREDICT_N_TOKENS_AT_A_TIME = 1
 MAX_VOCAB_SIZE = 29 # Must be <= number of tokens in the corpus
 BATCH_SIZE = 128  # Max, will use smaller batches sometimes
-TEMPERATURE = 1.1
+TEMPERATURE = 1.5
 
 corpus = """
 a b c d e f g h i j k l m n o p q r s t u v w x y z
@@ -442,6 +442,7 @@ def collect_trajectories(policy_net, value_net, prompts,
                          max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS_AT_A_TIME,
                          total_length=TOTAL_SEQUENCE_LENGTH,
                          epsilon=-float("inf")):
+    global TEMPERATURE
     states = []
     actions = []
     rewards = []
@@ -495,8 +496,8 @@ def collect_trajectories(policy_net, value_net, prompts,
                 values.append(value.flatten().mean())
             iterations -= 1
             seq_text = tokenizer.decode(int_seq)
-            good_chars = seq_text.count("c") - prompt.count("c") / (TOTAL_SEQUENCE_LENGTH/2)
-            bad_chars = seq_text.count("h") - prompt.count("h") / TOTAL_SEQUENCE_LENGTH
+            good_chars = seq_text.count("x") - prompt.count("x") #/ (TOTAL_SEQUENCE_LENGTH/2)
+            bad_chars = seq_text.count("d") + seq_text.count("b") #- prompt.count("a") - prompt.count("d") #/ TOTAL_SEQUENCE_LENGTH
             if iterations == 0:
                 
                 
@@ -504,14 +505,24 @@ def collect_trajectories(policy_net, value_net, prompts,
                 all_chars = set(seq_text)
                 unique_chars = len(all_chars) - len(set(prompt))
                 #reward = good_chars - (0.3*bad_chars) + (num_whitespaces / (0.5*TOTAL_SEQUENCE_LENGTH))
-                reward = num_whitespaces #22-
+                reward = (bad_chars * 4) - good_chars#num_whitespaces #22-
+
                 print(f"---> Desired chars: {good_chars} vs whitespace: {num_whitespaces} vs unique chars: {unique_chars} ------ Reward: {reward}")
                 rewards.append(reward)
             else:
-                rewards.append(0.0)#0.01 * int(good_chars > bad_chars))#rewards.append(0.0)
+                rewards.append(0.0)#((good_chars*2) - bad_chars) / 10)#0.0)#0.01 * int(good_chars > bad_chars))#rewards.append(0.0)
             
             avg_reward += rewards[-1]
-    print(f"Average reward: {avg_reward / len(prompts)}")
+    avg_reward /= len(prompts)
+    print(f"Average reward: {avg_reward}")
+    if avg_reward > 0.0:
+        # HUH? rewards = [r - avg_reward for r in rewards]
+        newtemp = TEMPERATURE * 0.9
+    elif avg_reward < 0.0:
+        newtemp = TEMPERATURE * 1.1
+    TEMPERATURE = max(0.9, min(10.0, newtemp))
+    print(f"Temperature: {TEMPERATURE}")
+
     return states, actions, rewards, masks, log_probs, values
 
 
@@ -519,7 +530,7 @@ policy_net = PolicyNetwork(model).to(device)
 value_net = ValueNetwork(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)
 
 # Initialize PPO
-ppo = PPO(policy_net, value_net, update_epochs=30)
+ppo = PPO(policy_net, value_net, update_epochs=10)
 
 # Training loop
 num_epochs = 1000
@@ -533,7 +544,7 @@ num_steps = 2048
 # ]
 prompts = [
     "a",
-    # "a b ",
+    "a b ",
     # "a b",
     # "ab",
     # "b c d ",
@@ -548,8 +559,8 @@ prompts = [
     # "l m n o p q r",
     # "l m nod d d",
     # "d e f",
-    # "x y z",
-    # "w x y z",
+    "x y z",
+    "w x y z",
     # "w x y z\na b c",
     # "z\na b c d"
 ]
