@@ -7,6 +7,9 @@ import torch
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+torch.manual_seed(0)
+random.seed(0)
+
 PADDING_IDX = 0
 TOTAL_SEQUENCE_LENGTH = 20
 PREDICT_N_TOKENS_AT_A_TIME = 1
@@ -348,23 +351,24 @@ class ValueNetwork(torch.nn.Module):
         self.fc1 = torch.nn.Linear(embedding_dim, 128)
         self.fc2 = torch.nn.Linear(max_len, 128)
         self.fc3 = torch.nn.Linear(128, 1)
+        self.fc4 = torch.nn.Linear(128, 1)
 
     def forward(self, x, mask):
-        x = self.embedding(x)
-        x = x.squeeze(2) * mask
+        x = self.embedding(x * mask).squeeze(2)
+        #x = x.squeeze(2) * mask
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x.transpose(1, 2)))
-        value = self.fc3(x.transpose(1, 2))
+        x = torch.relu(self.fc3(x.transpose(1, 2)))
+        value = self.fc4(x.transpose(1, 2))
         return value
 
 class PPO:
-    def __init__(self, net, policy_net, value_net, policy_lr=0.001, value_lr=0.0001, gamma=0.999, clip_epsilon=0.2,
+    def __init__(self, policy_net, value_net, policy_lr=0.00001, value_lr=0.0001, gamma=1.0, clip_epsilon=0.2,
                  update_epochs=10, batch_size=BATCH_SIZE):
         self.policy_net = policy_net
         self.value_net = value_net
-        self.net = net
-        self.policy_optimizer = torch.optim.Adam(net.parameters(), lr=policy_lr)
-        self.value_optimizer = torch.optim.Adam(value_net.parameters(), lr=value_lr)
+        self.policy_optimizer = torch.optim.AdamW(policy_net.parameters(), lr=policy_lr)
+        self.value_optimizer = torch.optim.AdamW(value_net.parameters(), lr=value_lr)
         self.gamma = gamma
         self.clip_epsilon = clip_epsilon
         self.update_epochs = update_epochs
@@ -379,33 +383,30 @@ class PPO:
         return ((tensor - mean) / (std + 1e-8))#.tolist()
 
     def compute_advantages(self, rewards, values, masks):
-        advantages = []
-        returns = []
+        B, T = rewards.shape
+        advantages = torch.zeros_like(rewards, device=device)
+        returns = torch.zeros_like(rewards, device=device)
         rewards = self.normalize(rewards)
-        return_ = torch.zeros_like(values[0], device=device)  # Initialize return_ with the same shape as values
+
+        values = values.unsqueeze(-1)
 
         # Initialize the last return with the last reward
-        return_ = rewards[-1].clone()#.detach()
-        returns.append(return_)
-        # Initialize the last advantage with the last TD error
-        advantages.append(rewards[-1] - values[-1])
+        returns[:, -1] = rewards[:, -1]
+        advantages[:, -1] = rewards[:, -1] - values[:, -1]
 
-        for i in reversed(range(len(rewards) - 1)):
-            return_ = rewards[i] + self.gamma * return_  # Compute the return for the current step
-            returns.insert(0, return_)  # Insert at the beginning of the list and detach
+        for t in reversed(range(T - 1)):
+            returns[:, t] = rewards[:, t] + self.gamma * returns[:, t + 1] * masks[:, t + 1]
+            td_error = rewards[:, t] + self.gamma * values[:, t + 1] * masks[:, t + 1] - values[:, t]
+            advantages[:, t] = td_error + self.gamma * advantages[:, t + 1] * masks[:, t + 1]
 
-            td_error = rewards[i] + self.gamma * values[i + 1] - values[i]
-            advantage = td_error + self.gamma * advantages[0] if advantages else td_error
-            advantages.insert(0, advantage)  # Do not detach the advantage
-
-        return torch.tensor(advantages, device=device), torch.tensor(returns, device=device)
+        return advantages, returns
 
     def get_batch(self, trajectories):
         batch = random.sample(trajectories, self.batch_size)
         states, actions, rewards, masks, old_log_probs, values = zip(*batch)
         batch_states = torch.cat(states, dim=0)
         batch_actions = torch.cat(actions, dim=0)
-        batch_rewards = torch.tensor(rewards, device=device).reshape(self.batch_size, 1)
+        batch_rewards = torch.tensor(rewards, device=device, dtype=torch.float32).reshape(self.batch_size, 1)
         batch_masks = torch.cat(masks, dim=0)
         batch_relevant_indices = [((mask == 1).nonzero(as_tuple=True)[1][-1].item() + 1) for mask in masks]
         batch_old_log_probs = torch.cat(old_log_probs, dim=0)
@@ -434,11 +435,10 @@ class PPO:
                 ratio = torch.exp(log_probs - batch_old_log_probs)
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages
-                policy_loss = torch.min(surr1, surr2).mean()
-                # if policy_loss < 0:
-                #     import ipdb; ipdb.set_trace()
+                policy_loss = -torch.min(surr1, surr2).mean() ########## MINUS SIGN HERE
+                
                 value = self.value_net(batch_states, batch_masks)
-                value_loss = (returns - value[:, -1, :]).pow(2).mean()
+                value_loss = (returns - value.squeeze(-1)).pow(2).mean()
                 self.value_optimizer.zero_grad()
                 value_loss.backward()
                 self.value_optimizer.step()
@@ -451,7 +451,7 @@ class PPO:
 
 
 
-def collect_trajectories(net, policy_net, value_net, prompts,
+def collect_trajectories(policy_net, value_net, prompts,
                          max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS_AT_A_TIME,
                          total_length=TOTAL_SEQUENCE_LENGTH,
                          epsilon=-float("inf")):
@@ -482,10 +482,10 @@ def collect_trajectories(net, policy_net, value_net, prompts,
             assert mask_tensor.view(-1)[-1] == 0
 
             with torch.no_grad():
-                output = net(seq_tensor, mask_tensor)
+                output = policy_net(seq_tensor, mask_tensor)
                 value = value_net(seq_tensor, mask_tensor)
 
-            output = output.squeeze(0)  # This chops off the batch dimension??????????
+            output = output.squeeze(0)
             relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
             logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
             
@@ -504,24 +504,21 @@ def collect_trajectories(net, policy_net, value_net, prompts,
             
             actions.append(action)
             log_probs.append(log_prob)
-            # with torch.no_grad():
-            #     value = value_net(seq_tensor, mask_tensor).detach()
-            values.append(value.detach().flatten()[-1].view(1))
+            values.append(value.flatten()[-1].view(1))
             iterations -= 1
             seq_text = tokenizer.decode(int_seq)
             good_chars = seq_text.count("c") - prompt.count("c")# / (TOTAL_SEQUENCE_LENGTH/2)
-            bad_chars = seq_text.count("h") - prompt.count("h") #/ TOTAL_SEQUENCE_LENGTH
+            bad_chars = seq_text.count("e") - prompt.count("e") #/ TOTAL_SEQUENCE_LENGTH
+            num_whitespaces = (seq_text.count(" ") + seq_text.count("\n")) - (prompt.count(" ") + prompt.count("\n"))
             all_chars = set(seq_text)
             unique_chars = len(all_chars)
             if iterations == 0:
-                num_whitespaces = (seq_text.count(" ") + seq_text.count("\n")) #/ TOTAL_SEQUENCE_LENGTH
-                 #- len(set(prompt))
-                reward = -num_whitespaces #good_chars - (0.3*bad_chars) + (num_whitespaces / (0.5*TOTAL_SEQUENCE_LENGTH))
+                reward = num_whitespaces#good_chars - bad_chars - (num_whitespaces/40) #good_chars - (0.3*bad_chars) + (num_whitespaces / (0.5*TOTAL_SEQUENCE_LENGTH))
                 print(f"---> Desired chars: {good_chars} vs whitespace: {num_whitespaces} vs unique chars: {unique_chars} ------ Reward: {reward}")
                 rewards.append(reward)
             else:
 
-                rewards.append(0.0)#2*unique_chars)#0.01 * int(good_chars > bad_chars))#rewards.append(0.0)
+                rewards.append(0.0)#num_whitespaces/100)#good_chars/10 + unique_chars/10)#2*unique_chars)#0.01 * int(good_chars > bad_chars))#rewards.append(0.0)
             
             avg_reward += rewards[-1]
     print(f"Average reward: {avg_reward / len(prompts)}")
@@ -533,7 +530,7 @@ policy_net = PolicyNetwork(model).to(device)
 value_net = ValueNetwork(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)
 
 # Initialize PPO
-ppo = PPO(model, policy_net, value_net, update_epochs=3, batch_size=1)#BATCH_SIZE)
+ppo = PPO(policy_net, value_net, update_epochs=800, batch_size=32)#BATCH_SIZE)
 
 # Training loop
 num_epochs = 1000
@@ -563,14 +560,15 @@ prompts = [
     "l m nod d d",
     "d e f",
     "x y z",
-    "w x y z"
-    "w x y z\na b c"
+    "w x y z",
+    "w x y z\na b c",
     "z\na b c d"
 ]
 
 try:
     for epoch in range(num_epochs):
-        trajectories = collect_trajectories(model, policy_net, value_net, prompts)
+        with torch.no_grad():
+            trajectories = collect_trajectories(policy_net, value_net, prompts)
         ppo.update(trajectories)
         print(f"Epoch {epoch} completed")
 except KeyboardInterrupt:

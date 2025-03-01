@@ -7,6 +7,9 @@ import torch
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+torch.manual_seed(0)
+random.seed(0)
+
 PADDING_IDX = 0
 TOTAL_SEQUENCE_LENGTH = 20
 PREDICT_N_TOKENS_AT_A_TIME = 1
@@ -357,6 +360,7 @@ class PPO:
         self.update_epochs = update_epochs
     
     def normalize(self, tensor):
+        return tensor
         tensor = torch.tensor(tensor, device=device)
         mean = tensor.mean()
         std = tensor.std()
@@ -392,6 +396,9 @@ class PPO:
         #import ipdb; ipdb.set_trace()
 
         for _ in range(self.update_epochs):
+            total_policy_loss = None
+            total_value_loss = None
+
             for state, action, mask, old_log_prob, advantage, return_ in zip(states, actions, masks, old_log_probs, advantages, returns):
                 logits = self.policy_net(state, mask)
                 
@@ -406,7 +413,10 @@ class PPO:
 
                 
                 
-                policy_loss = -torch.min(surr1, surr2).mean()
+                policy_loss = torch.min(surr1, surr2).mean()
+                # if policy_loss.item() < 0:
+                #     print(f"Negative policy loss: {policy_loss.item()}")
+                #     continue
 
                 value = self.value_net(state, mask)
                 value = value[:, -1, :]#.squeeze(2)
@@ -424,7 +434,15 @@ class PPO:
                 self.value_optimizer.zero_grad()
                 value_loss.backward()
                 self.value_optimizer.step()
-            print(f"Policy loss: {policy_loss.item()}, Value loss: {value_loss.item()}")
+
+                if total_policy_loss is None:
+                    total_policy_loss = policy_loss
+                    total_value_loss = value_loss
+                else:
+                    total_policy_loss += policy_loss
+                    total_value_loss += value_loss
+            
+            print(f"Policy loss: {total_policy_loss.item()}, Value loss: {total_value_loss.item()}")
 
 
 def collect_trajectories(policy_net, value_net, prompts,
@@ -483,8 +501,8 @@ def collect_trajectories(policy_net, value_net, prompts,
                 values.append(value.flatten()[-1])
             iterations -= 1
             seq_text = tokenizer.decode(int_seq)
-            good_chars = seq_text.count("c") - prompt.count("c") / (TOTAL_SEQUENCE_LENGTH/2)
-            bad_chars = seq_text.count("h") - prompt.count("h") / TOTAL_SEQUENCE_LENGTH
+            good_chars = seq_text.count("d") - prompt.count("d") #/ (TOTAL_SEQUENCE_LENGTH/2)
+            bad_chars = seq_text.count("h") - prompt.count("h")# / TOTAL_SEQUENCE_LENGTH
             if iterations == 0:
                 
                 
@@ -492,9 +510,10 @@ def collect_trajectories(policy_net, value_net, prompts,
                 all_chars = set(seq_text)
                 unique_chars = len(all_chars) - len(set(prompt))
                 #reward = good_chars - (0.3*bad_chars) + (num_whitespaces / (0.5*TOTAL_SEQUENCE_LENGTH))
-                reward = -num_whitespaces
+                reward = good_chars + num_whitespaces * 1.1#good_chars - (bad_chars/2)#* 4 + num_whitespaces / 5
                 print(f"---> Desired chars: {good_chars} vs whitespace: {num_whitespaces} vs unique chars: {unique_chars} ------ Reward: {reward}")
-                rewards.append(reward)
+                assert reward >= 0
+                rewards.append((reward)/100) # USE 30-reward to make it neg! So it still pos!
             else:
                 rewards.append(0.0)#0.01 * int(good_chars > bad_chars))#rewards.append(0.0)
             
@@ -507,7 +526,7 @@ policy_net = PolicyNetwork(model).to(device)
 value_net = ValueNetwork(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)
 
 # Initialize PPO
-ppo = PPO(policy_net, value_net)
+ppo = PPO(policy_net, value_net, update_epochs=20)
 
 # Training loop
 num_epochs = 1000
@@ -529,16 +548,16 @@ prompts = [
     "a b c d e",
     "c d e ",
     "a b c d e ",
-    "a b c a b",
-    "a b c a b c a b c",
+    # "a b c a b",
+    # "a b c a b c a b c",
     "a b c d e",
-    "f g h b c",
-    "l m n o p q r",
-    "l m nod d d",
-    "d e f",
+    # "f g h b c",
+    # "l m n o p q r",
+    # "l m nod d d",
+    # "d e f",
     "x y z",
-    "w x y z"
-    "w x y z\na b c"
+    "w x y z",
+    "w x y z\na b",
     "z\na b c d"
 ]
 
