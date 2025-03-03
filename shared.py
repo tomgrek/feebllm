@@ -351,9 +351,12 @@ class PPO:
                  update_epochs=10, batch_size=BATCH_SIZE):
         self.policy_net = policy_net
         self.value_net = value_net
-        self.policy_optimizer = torch.optim.Adam(policy_net.parameters(), lr=policy_lr)
-        ###### UGGHHHHH
-        self.value_optimizer = torch.optim.Adam(value_net.model.value_head.parameters(), lr=value_lr)
+        #self.policy_optimizer = torch.optim.Adam(policy_net.parameters(), lr=policy_lr)
+        ###### UGGHHHHH model.value_head.
+        #self.value_optimizer = torch.optim.Adam(value_net.parameters(), lr=value_lr)
+        # params = list(policy_net.parameters()) + list(value_net.parameters())
+        params = set(policy_net.parameters()).union(set(value_net.parameters()))
+        self.optimizer = torch.optim.Adam(params, lr=policy_lr)
         self.gamma = gamma
         self.clip_epsilon = clip_epsilon
         self.update_epochs = update_epochs
@@ -394,6 +397,7 @@ class PPO:
         batch_rewards = torch.tensor(rewards, device=device).reshape(self.batch_size, 1)
         batch_masks = torch.cat(masks, dim=0)
         batch_relevant_indices = [((mask == 1).nonzero(as_tuple=True)[1][-1].item() + 1) for mask in masks]
+        batch_relevant_indices = torch.tensor(batch_relevant_indices, device=device)
         batch_old_log_probs = torch.cat(old_log_probs, dim=0)
         batch_values = torch.cat(values, dim=0)
         return batch_states, batch_actions, batch_rewards, batch_masks, batch_relevant_indices, batch_old_log_probs, batch_values
@@ -408,8 +412,7 @@ class PPO:
 
                 logits = self.policy_net(batch_states, batch_masks)
                 
-                indices = torch.tensor(batch_relevant_indices, device=device)
-                these_logits = logits.gather(1, indices.view(-1, 1, 1).expand(-1, -1, logits.size(-1)))
+                these_logits = torch.gather(logits, 1, batch_relevant_indices.view(-1, 1, 1).expand(-1, -1, logits.size(-1)))  # correct
                 # TODO this breaks PREDICT_N_TOKENS_AT_A_TIME > 1
                 dist = Categorical(logits=these_logits / TEMPERATURE)
 
@@ -420,13 +423,22 @@ class PPO:
                 policy_loss = -torch.min(surr1, surr2).mean()
                 value = self.value_net(batch_states, batch_masks)
                 
-                value_loss = (returns - value).pow(2).mean()
-                self.value_optimizer.zero_grad()
-                value_loss.backward()
-                self.value_optimizer.step()
-                self.policy_optimizer.zero_grad()
-                policy_loss.backward()
-                self.policy_optimizer.step()
+                
+                # This works but value is bs x seqlen x 1 while returns is bs x 1
+                # value_loss = (returns - value).pow(2).mean()
+                # This seems more correct but doesn't work
+                # value_loss = (returns - value.squeeze(-1).mean(-1)).pow(2).mean()
+                value_loss = (returns - value.squeeze(-1)[:, -1]).pow(2).mean()
+                
+                #self.value_optimizer.zero_grad()
+                #value_loss.backward()
+                #self.value_optimizer.step()
+                #self.policy_optimizer.zero_grad()
+                self.optimizer.zero_grad()
+                #policy_loss.backward()
+                #self.policy_optimizer.step()
+                (policy_loss + value_loss).backward()
+                self.optimizer.step()
                 epoch_value_loss += value_loss.item()
                 epoch_policy_loss += policy_loss.item()
             print(f"Policy loss: {epoch_policy_loss}, Value loss: {epoch_value_loss}")
@@ -490,18 +502,17 @@ def collect_trajectories(policy_net, value_net, prompts,
             
             actions.append(action)
             log_probs.append(log_prob)
-            # with torch.no_grad():
-            #     value = value_net(seq_tensor, mask_tensor).detach()
+
             values.append(value.detach().flatten()[-1].view(1))
             iterations -= 1
             seq_text = tokenizer.decode(int_seq)
-            good_chars = seq_text.count("c") - prompt.count("c") / (TOTAL_SEQUENCE_LENGTH/2)
-            bad_chars = seq_text.count("h") - prompt.count("h") / TOTAL_SEQUENCE_LENGTH
+            good_chars = seq_text.count("f") + seq_text.count("c")
+            bad_chars = seq_text.count("x") - prompt.count("x")
             all_chars = set(seq_text)
             unique_chars = len(all_chars)
             if iterations == 0:
                 num_whitespaces = (seq_text.count(" ") + seq_text.count("\n"))
-                reward = -num_whitespaces
+                reward = (good_chars * 2) - bad_chars
                 print(f"---> Desired chars: {good_chars} vs whitespace: {num_whitespaces} vs unique chars: {unique_chars} ------ Reward: {reward}")
                 rewards.append(reward)
             else:
@@ -509,14 +520,17 @@ def collect_trajectories(policy_net, value_net, prompts,
                 rewards.append(0.0)#(0.02*unique_chars)#0.01 * int(good_chars > bad_chars))#rewards.append(0.0)
             
             avg_reward += rewards[-1]
-    print(f"Average reward: {avg_reward / len(prompts)}")
-    if avg_reward > -5.0:
+    avg_reward /= len(prompts)
+    print(f"Average reward: {avg_reward}")
+    if avg_reward > 5:
         next_temp = TEMPERATURE * 0.9
-    elif avg_reward < -7.0:
+    elif avg_reward < 3:
         next_temp = TEMPERATURE * 1.1
     else:
         next_temp = TEMPERATURE
+    print(f"Next temperature should be: {next_temp}")
     next_temp = max(0.9, min(4.0, next_temp))
+    print(f"Next temperature will be: {next_temp}")
     
     return [(x, y, z, a, b, c) for x, y, z, a, b, c in zip(states, actions, rewards, masks, log_probs, values)]
     #return zip(states, actions, rewards, masks, log_probs, values)
@@ -526,7 +540,7 @@ policy_net = PolicyNetwork(model).to(device)
 value_net = ValueNetwork(model).to(device)
 
 # Initialize PPO
-ppo = PPO(policy_net, value_net, update_epochs=10, batch_size=1)
+ppo = PPO(policy_net, value_net, update_epochs=10, batch_size=8)
 
 prompts = [
     "a",
