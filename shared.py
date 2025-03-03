@@ -363,29 +363,33 @@ class PPO:
         self.batch_size = batch_size
     
     def normalize(self, tensor):
+        return tensor
         # tensor = torch.tensor(tensor, device=device)
         mean = tensor.mean()
         std = tensor.std()
         return ((tensor - mean) / (std + 1e-8))#.tolist()
 
     def compute_advantages(self, rewards, values, masks):
-        advantages = []
-        returns = []
-        # rewards = self.normalize(rewards)
-        return_ = torch.zeros_like(values[0], device=device)
-        
-        returns.append(rewards[-1])
-        # Initialize the last advantage with the last TD error
-        advantages.append(values[-1] - return_)
-        # Previously I had advantages.append(rewards[-1] - values[-1])
+        B, T = rewards.shape
+        advantages = torch.zeros_like(rewards, device=device)
+        returns = torch.zeros_like(rewards, device=device)
+        rewards = self.normalize(rewards)
+        values = values.squeeze(-1)
 
-        for i in reversed(range(len(rewards) - 1)):
-            return_ = rewards[i] + self.gamma * return_  # Compute the return for the current step
-            returns.insert(0, return_)  # Insert at the beginning of the list and detach
+        # Initialize the last return with the last reward
+        returns[:, -1] = rewards[:, -1]
+        advantages[:, -1] = rewards[:, -1] - values[:, -1] # TODO NEXT WHEN THIS DUN WORK... rewards should be bs x seq_len x 1 too !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-            td_error = rewards[i] + self.gamma * values[i + 1] - values[i]
-            advantage = td_error + self.gamma * advantages[0]
-            advantages.insert(0, advantage)
+        for t in reversed(range(T - 1)):
+            returns[:, t] = rewards[:, t] + self.gamma * returns[:, t + 1] * masks[:, t + 1]
+            td_error = rewards[:, t] + self.gamma * values[:, t + 1] * masks[:, t + 1] - values[:, t]
+            advantages[:, t] = td_error + self.gamma * advantages[:, t + 1] * masks[:, t + 1]
+
+        # Ensure returns has shape (batch_size, seq_len, 1)
+        returns = returns.unsqueeze(-1)
+        advantages = advantages.unsqueeze(-1)
+
+        return advantages, returns
 
         return torch.tensor(advantages, device=device), torch.tensor(returns, device=device)
 
@@ -428,7 +432,7 @@ class PPO:
                 # value_loss = (returns - value).pow(2).mean()
                 # This seems more correct but doesn't work
                 # value_loss = (returns - value.squeeze(-1).mean(-1)).pow(2).mean()
-                value_loss = (returns - value.squeeze(-1)[:, -1]).pow(2).mean()
+                value_loss = (returns - value).pow(2).mean()
                 
                 #self.value_optimizer.zero_grad()
                 #value_loss.backward()
@@ -503,7 +507,7 @@ def collect_trajectories(policy_net, value_net, prompts,
             actions.append(action)
             log_probs.append(log_prob)
 
-            values.append(value.detach().flatten()[-1].view(1))
+            values.append(value)
             iterations -= 1
             seq_text = tokenizer.decode(int_seq)
             good_chars = seq_text.count("f") + seq_text.count("c")
@@ -540,7 +544,7 @@ policy_net = PolicyNetwork(model).to(device)
 value_net = ValueNetwork(model).to(device)
 
 # Initialize PPO
-ppo = PPO(policy_net, value_net, update_epochs=10, batch_size=8)
+ppo = PPO(policy_net, value_net, update_epochs=100, batch_size=1)
 
 prompts = [
     "a",
