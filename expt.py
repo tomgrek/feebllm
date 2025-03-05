@@ -15,13 +15,14 @@ TOTAL_SEQUENCE_LENGTH = 20
 PREDICT_N_TOKENS_AT_A_TIME = 1
 MAX_VOCAB_SIZE = 29 # Must be <= number of tokens in the corpus
 BATCH_SIZE = 128  # Max, will use smaller batches sometimes
-TEMPERATURE = 1.5
+TEMPERATURE = 1.0##5
 next_temp = TEMPERATURE
 
 corpus = """
 a b c d e f g h i j k l m n o p q r s t u v w x y z
 a b c d e f g h i j k l m n o p q r s t u v w x y z
 a b c d e f g h i j k l m n o p q r s t u v w x y z
+a b c d e d e d e d e l m n o p q r s t u v w x y z
 """
 # Using # for padding so strip it
 corpus_tokens = corpus.replace("#", "").split()
@@ -194,7 +195,7 @@ class Model(torch.nn.Module):
         self.fc = torch.nn.Linear(embedding_dim, num_tokens)
         self.dropout = torch.nn.Dropout(0.1)
         self.layer_norm = torch.nn.LayerNorm(embedding_dim)
-        #self.value_head = torch.nn.Linear(embedding_dim, 1)
+        self.value_head = torch.nn.Linear(embedding_dim, 1)
 
     def forward(self, x, mask):
         seq_length = x.size(1)
@@ -210,8 +211,8 @@ class Model(torch.nn.Module):
         x = self.layer_norm(x)
         x = self.dropout(x)
         policy_logits = self.fc(x)
-        #value = self.value_head(x)
-        return policy_logits#, value
+        value = self.value_head(x)
+        return policy_logits, value
 
 def train(model, data, epochs=20, early_stop=-float("inf")):
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.002, weight_decay=0.01)
@@ -224,7 +225,7 @@ def train(model, data, epochs=20, early_stop=-float("inf")):
             mini_batch_size = BATCH_SIZE
         datas = [get_batch(data, bs=mini_batch_size) for _ in range(len(data) // BATCH_SIZE)]
         for seq, target, input_mask, output_mask in datas:
-            output = model(seq, input_mask)
+            output, _ = model(seq, input_mask)
             
             loss = torch.nn.functional.cross_entropy(output.permute(0, 2, 1), target, reduction='none')
             
@@ -259,7 +260,7 @@ total_correct = 0
 
 for i in range(num_eval):
     seq, target, input_mask, output_mask = get_batch(eval_examples, bs=1)
-    output = model(seq, input_mask)
+    output, _ = model(seq, input_mask)
     output = output.squeeze(0)
     relevant_index = (output_mask == 1).nonzero(as_tuple=True)[1][0].item()
     
@@ -300,7 +301,7 @@ def generate(prompt, iterations=3,
             assert mask_tensor.view(-1)[-1] == 0
 
             with torch.no_grad():
-                output = model(seq_tensor, mask_tensor)
+                output, _ = model(seq_tensor, mask_tensor)
             output = output.squeeze(0)
             relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
             logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
@@ -336,43 +337,42 @@ class PolicyNetwork(torch.nn.Module):
         self.model = model
 
     def forward(self, x, mask):
-        return self.model(x, mask)
-        #logits, _ = self.model(x, mask)
-        #return logits
+        logits, _ = self.model(x, mask)
+        return logits
 
-# class ValueNetwork(torch.nn.Module):
-#     def __init__(self, model):
-#         super(ValueNetwork, self).__init__()
-#         self.model = model
-
-#     def forward(self, x, mask):
-#         _, value = self.model(x, mask)
-#         return value
 class ValueNetwork(torch.nn.Module):
-    def __init__(self, embedding_dim, num_tokens):
+    def __init__(self, model):
         super(ValueNetwork, self).__init__()
-        self.embedding = torch.nn.Embedding(num_tokens, embedding_dim)
-        self.fc1 = torch.nn.Linear(embedding_dim, 128)
-        self.fc2 = torch.nn.Linear(128, 1)
+        self.model = model
 
     def forward(self, x, mask):
-        x = self.embedding(x)
-        x = x.squeeze(2) * mask
-        x = torch.relu(self.fc1(x))
-        value = self.fc2(x)
+        _, value = self.model(x, mask)
         return value
+# class ValueNetwork(torch.nn.Module):
+#     def __init__(self, embedding_dim, num_tokens):
+#         super(ValueNetwork, self).__init__()
+#         self.embedding = torch.nn.Embedding(num_tokens, embedding_dim)
+#         self.fc1 = torch.nn.Linear(embedding_dim, 128)
+#         self.fc2 = torch.nn.Linear(128, 1)
+
+#     def forward(self, x, mask):
+#         x = self.embedding(x)
+#         x = x.squeeze(2) * mask
+#         x = torch.relu(self.fc1(x))
+#         value = self.fc2(x)
+#         return value
 
 class PPO:
     def __init__(self, policy_net, value_net, policy_lr=0.0001, value_lr=0.0001, gamma=0.99, clip_epsilon=0.2,
                  update_epochs=10, batch_size=BATCH_SIZE):
         self.policy_net = policy_net
         self.value_net = value_net
-        self.policy_optimizer = torch.optim.Adam(policy_net.parameters(), lr=policy_lr)
+        #self.policy_optimizer = torch.optim.Adam(policy_net.parameters(), lr=policy_lr)
         ###### UGGHHHHH model.value_head.
-        self.value_optimizer = torch.optim.Adam(value_net.parameters(), lr=value_lr) # .model.value_head.
+        #self.value_optimizer = torch.optim.Adam(value_net.parameters(), lr=value_lr) # .model.value_head.
         # params = list(policy_net.parameters()) + list(value_net.parameters())
-        # params = set(policy_net.parameters()).union(set(value_net.parameters()))
-        # self.optimizer = torch.optim.Adam(params, lr=policy_lr)
+        params = set(policy_net.parameters()).union(set(value_net.parameters()))
+        self.optimizer = torch.optim.Adam(params, lr=policy_lr)
         self.gamma = gamma
         self.clip_epsilon = clip_epsilon
         self.update_epochs = update_epochs
@@ -395,19 +395,18 @@ class PPO:
         return advantages, returns
 
     def get_batch(self, trajectories):
-        # TODO this returns 1 trajectory for every generation up to seqlen
-        # ie 18 for the first prompt. So a batch needs to sample from this, too.
-        #
-        batch = random.sample(trajectories, self.batch_size)
+        flattened_trajectories = [x for traj in trajectories for x
+                                  in zip(traj[0], traj[1], traj[2], traj[3], traj[4], traj[5])]
+        batch = random.sample(flattened_trajectories, self.batch_size)
         states, actions, rewards, masks, old_log_probs, values = [x[0] for x in batch], [x[1] for x in batch], [x[2] for x in batch], [x[3] for x in batch], [x[4] for x in batch], [x[5] for x in batch]
-        batch_states = torch.cat(*states, dim=0)
-        batch_actions = torch.cat(*actions, dim=0)
-        batch_rewards = torch.tensor(*rewards, device=device).reshape(-1, 1)
-        batch_masks = torch.cat(*masks, dim=0)
+        batch_states = torch.cat(states, dim=0)
+        batch_actions = torch.cat(actions, dim=0)
+        batch_rewards = torch.tensor(rewards, device=device).reshape(-1, 1)
+        batch_masks = torch.cat(masks, dim=0)
         batch_relevant_indices = [((mask == 1).nonzero(as_tuple=True)[0][-1].item() + 1) for mask in batch_masks]
         batch_relevant_indices = torch.tensor(batch_relevant_indices, device=device)
-        batch_old_log_probs = torch.cat(*old_log_probs, dim=0)
-        batch_values = torch.cat(*values, dim=0)
+        batch_old_log_probs = torch.cat(old_log_probs, dim=0)
+        batch_values = torch.cat(values, dim=0)
         return batch_states, batch_actions, batch_rewards, batch_masks, batch_relevant_indices, batch_old_log_probs, batch_values
 
 
@@ -438,15 +437,15 @@ class PPO:
                 # value_loss = (returns - value.squeeze(-1).mean(-1)).pow(2).mean()
                 value_loss = (returns - value.squeeze(-1).mean(dim=-1)).pow(2).mean()
                 
-                self.value_optimizer.zero_grad()
-                value_loss.backward(retain_graph=True)
-                self.value_optimizer.step()
-                self.policy_optimizer.zero_grad()
-                # self.optimizer.zero_grad()
-                policy_loss.backward()
-                self.policy_optimizer.step()
-                # (policy_loss + value_loss).backward()
-                # self.optimizer.step()
+                # self.value_optimizer.zero_grad()
+                # value_loss.backward(retain_graph=True)
+                # self.value_optimizer.step()
+                # self.policy_optimizer.zero_grad()
+                self.optimizer.zero_grad()
+                # policy_loss.backward()
+                # self.policy_optimizer.step()
+                (policy_loss + value_loss).backward()
+                self.optimizer.step()
                 epoch_value_loss += value_loss.item()
                 epoch_policy_loss += policy_loss.item()
             print(f"Policy loss: {epoch_policy_loss}, Value loss: {epoch_value_loss}")
@@ -474,7 +473,7 @@ def collect_trajectories(policy_net, value_net, prompts,
         log_probs_ = []
         values_ = []
         int_seq = tokenizer.tokenize(prompt) 
-        iterations = TOTAL_SEQUENCE_LENGTH - len(int_seq) - PREDICT_N_TOKENS_AT_A_TIME
+        iterations = max_len - len(int_seq)
         while iterations > 0:
             true_seq = deepcopy(int_seq)   
             mask = [1] * len(int_seq) + [0] * (total_length - len(int_seq))
@@ -519,12 +518,14 @@ def collect_trajectories(policy_net, value_net, prompts,
             iterations -= 1
             seq_text = tokenizer.decode(int_seq)
             good_chars = seq_text.count("i") + seq_text.count("j") + seq_text.count("k") - prompt.count("i") - prompt.count("j") - prompt.count("k")#+ prompt.count("e")
-            bad_chars = (seq_text.count("d")/10) + (seq_text.count("d e") * 5) - prompt.count("d")/10 - prompt.count("d e")*5
+            bad_chars = (seq_text.count("d")/10) + (seq_text.count("e")/10) + (seq_text.count("d e") * 5) - prompt.count("d")/10 - prompt.count("d e")*5 - (prompt.count("e")/10)
             all_chars = set(seq_text)
             unique_chars = len(all_chars)
             if iterations == 0:
                 num_whitespaces = (seq_text.count(" ") + seq_text.count("\n"))
                 reward = (bad_chars * 4) - good_chars
+                # if reward == 0:
+                #     reward = (random.random() * 0.1) - 0.05
                 print(f"---> Desired chars: {good_chars} vs whitespace: {num_whitespaces} vs unique chars: {unique_chars} ------ Reward: {reward}")
                 rewards_.append(reward)
             else:
@@ -551,40 +552,42 @@ def collect_trajectories(policy_net, value_net, prompts,
 
 
 policy_net = PolicyNetwork(model).to(device)
-value_net = ValueNetwork(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)# ValueNetwork(model).to(device)
+value_net = ValueNetwork(model).to(device) # ValueNetwork(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)# 
 
 # Initialize PPO
-ppo = PPO(policy_net, value_net, update_epochs=10, batch_size=1)
+ppo = PPO(policy_net, value_net, update_epochs=6, batch_size=18)
 
 prompts = [
     "a",
     "a b ",
-    # "a b",
+    "a b",
+    "a b c",
+    "a b c d",
+    "a b c d ",
     # "ab",
     # "b c d ",
     # "b c d e ",
-    "a bc d e",
-    "c de ",
+    # "a bc d e",
+    # "c de ",
     # "a b c d e ",
     # "a b c a b",
     # "a b c a b c a b c",
     # "a b c d e",
-    "ef g h ",
+    # "ef g h ",
     # "l m n o p q r",
     # "l m nod d d",
     # "d e f",
     # "x y z",
-    "w x y z",
-    "r s t u v",
+    # "w x y z",
+    # "r s t u v",
     # "w x y z\na b c",
     # "z\na b c d"
 ]
 
-num_epochs = 100
-num_steps = 2048 ####################################### EHHHHHHH???????
+num_epochs = 200
 try:
     for epoch in range(num_epochs):
-        trajectories = collect_trajectories(policy_net, value_net, prompts, num_steps)
+        trajectories = collect_trajectories(policy_net, value_net, prompts)
         ppo.update(trajectories)
         print(f"Epoch {epoch} completed")
 except KeyboardInterrupt:
