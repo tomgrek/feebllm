@@ -11,7 +11,7 @@ torch.manual_seed(0)
 random.seed(0)
 
 PADDING_IDX = 0
-TOTAL_SEQUENCE_LENGTH = 20
+TOTAL_SEQUENCE_LENGTH = 30
 PREDICT_N_TOKENS_AT_A_TIME = 1
 MAX_VOCAB_SIZE = 29 # Must be <= number of tokens in the corpus
 BATCH_SIZE = 128  # Max, will use smaller batches sometimes
@@ -19,11 +19,14 @@ TEMPERATURE = 1.3#5
 next_temp = TEMPERATURE
 
 corpus = """
+front a b c d e f g h i j k l m n o p q r s t u v w x y z
+start a b c d e f g h i j k l m n o p q r s t u v w x y z
+forward a b c d e f g h i j k l m n o p q r s t u v w x y z
 a b c d e f g h i j k l m n o p q r s t u v w x y z
-a b c d e f g h i j k l m n o p q r s t u v w x y z
-a b c d e f g h i j k l m n o p q r s t u v w x y z
-z y x w v u t s r q p o n m l k j i h g f e d c b a
 """
+# reverse z y x w v u t s r q p o n m l k j i h g f e d c b a
+# back z y x w v u t s r q p o n m l k j i h g f e d c b a
+# rear z y x w v u t s r q p o n m l k j i h g f e d c b a
 # ai hi hi hi hi hi hi hi hihihihihihi
 # Using # for padding so strip it
 corpus_tokens = corpus.replace("#", "").split()
@@ -323,6 +326,9 @@ def generate(prompt, iterations=3,
 
 print(generate("a b c", 25))
 print(generate("l m n o", 25))
+print(generate("z y x", 25))
+print(generate("forward", 25))
+print(generate("back", 25))
 
 #############################################
 model.train()
@@ -339,42 +345,43 @@ class PolicyNetwork(torch.nn.Module):
         logits, _ = self.model(x, mask)
         return logits
 
-# class ValueNetwork(torch.nn.Module):
-#     def __init__(self, model):
-#         super(ValueNetwork, self).__init__()
-#         self.model = model
-
-#     def forward(self, x, mask):
-#         _, value = self.model(x, mask)
-#         return value
 class ValueNetwork(torch.nn.Module):
-    def __init__(self, embedding_dim, num_tokens):
+    def __init__(self, model):
         super(ValueNetwork, self).__init__()
-        self.embedding = torch.nn.Embedding(num_tokens, embedding_dim)
-        self.fc1 = torch.nn.Linear(embedding_dim, 128)
-        self.fc2 = torch.nn.Linear(128, 1)
+        self.model = model
 
     def forward(self, x, mask):
-        x = self.embedding(x)
-        x = x.squeeze(2) * mask
-        x = torch.relu(self.fc1(x))
-        value = self.fc2(x)
+        _, value = self.model(x, mask)
         return value
+# class ValueNetwork(torch.nn.Module):
+#     def __init__(self, embedding_dim, num_tokens):
+#         super(ValueNetwork, self).__init__()
+#         self.embedding = torch.nn.Embedding(num_tokens, embedding_dim)
+#         self.fc1 = torch.nn.Linear(embedding_dim, 128)
+#         self.fc2 = torch.nn.Linear(128, 1)
+
+#     def forward(self, x, mask):
+#         x = self.embedding(x)
+#         x = x.squeeze(2) * mask
+#         x = torch.relu(self.fc1(x))
+#         value = self.fc2(x)
+#         return value
 
 class PPO:
-    def __init__(self, policy_net, value_net, policy_lr=0.0001, value_lr=0.0001, gamma=0.99, clip_epsilon=0.3,
-                 update_epochs=10, batch_size=BATCH_SIZE):
+    def __init__(self, policy_net, value_net, policy_lr=0.0001, value_lr=0.0001, gamma=0.998, clip_epsilon=0.2,
+                 update_epochs=10, batch_size=BATCH_SIZE, entropy_coef=0.01):
         self.policy_net = policy_net
         self.value_net = value_net
         self.policy_optimizer = torch.optim.Adam(policy_net.parameters(), lr=policy_lr)
         ###### UGGHHHHH model.value_head.
-        self.value_optimizer = torch.optim.Adam(value_net.parameters(), lr=value_lr) # .model.value_head.
+        self.value_optimizer = torch.optim.Adam(value_net.model.value_head.parameters(), lr=value_lr) # .model.value_head.
         #params = set(policy_net.parameters()).union(set(value_net.parameters()))
         #self.optimizer = torch.optim.Adam(params, lr=policy_lr)
         self.gamma = gamma
         self.clip_epsilon = clip_epsilon
         self.update_epochs = update_epochs
         self.batch_size = batch_size
+        self.entropy_coef = entropy_coef
     
     def normalize(self, tensor):
         # tensor = torch.tensor(tensor, device=device)
@@ -394,10 +401,12 @@ class PPO:
         for t in reversed(range(T - 1)):
             returns[:, t, :] = rewards[:, t, :] + self.gamma * returns[:, t + 1, :] * masks[:, t + 1, :]
             td_error = rewards[:, t, :] + self.gamma * values[:, t + 1, :] * masks[:, t + 1, :] - values[:, t, :]
+            # Use the below one and comment out masks for maskless (fail) version
+            #td_error = rewards[:, t, :] + self.gamma * values[:, t + 1, :] - values[:, t, :]
             advantages[:, t, :] = td_error + self.gamma * advantages[:, t + 1, :] * masks[:, t + 1, :]
 
         # Normalize advantages
-        #advantages = self.normalize(advantages)
+        advantages = self.normalize(advantages)
 
         return advantages, returns
 
@@ -412,7 +421,7 @@ class PPO:
         batch_actions = torch.stack(actions, dim=0)
         batch_rewards = torch.stack(rewards, dim=0)
 
-        #batch_rewards = self.normalize(batch_rewards)
+        batch_rewards = self.normalize(batch_rewards)
         
         batch_masks = torch.stack(masks, dim=0).squeeze(1)
         batch_relevant_indices = [((mask == 1).nonzero(as_tuple=True)[0][-1].item() + 1) for mask in batch_masks]
@@ -441,9 +450,10 @@ class PPO:
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
+                entropy = dist.entropy().mean()
+                policy_loss -= self.entropy_coef * entropy
+
                 value = self.value_net(batch_states, batch_masks)
-                
-                
                 # This works but value is bs x seqlen x 1 while returns is bs x 1
                 # value_loss = (returns - value).pow(2).mean()
                 # This seems more correct but doesn't work
@@ -470,7 +480,7 @@ class PPO:
 
             print(f"Policy loss: {epoch_policy_loss}, Value loss: {epoch_value_loss}")
 
-def get_temperature(epoch, num_epochs, initial_temperature=1.2, final_temperature=1.0):
+def get_temperature(epoch, num_epochs, initial_temperature=6, final_temperature=-3.0):
     return initial_temperature + (final_temperature - initial_temperature) * (epoch / num_epochs)
 
 def get_epsilon(epoch, num_epochs, initial_epsilon=0.3, final_epsilon=-1):
@@ -486,7 +496,7 @@ def collect_trajectories(policy_net, value_net, prompts,
     trajectories = []
 
     avg_reward = 0.0
-    TEMPERATURE = get_temperature(epoch, num_epochs)
+    TEMPERATURE = 1.0#get_temperature(epoch, num_epochs)
     print(f"Temperature: {TEMPERATURE}")
     this_epsilon = get_epsilon(epoch, num_epochs, initial_epsilon=epsilon)
     print(f"Epsilon: {this_epsilon}")
@@ -532,7 +542,7 @@ def collect_trajectories(policy_net, value_net, prompts,
             dist = Categorical(logits=logits / TEMPERATURE)
 
             got_some_random = random.random() < this_epsilon
-            if got_some_random: # TODO this only works for the print if it's the last epoch.
+            if False:#got_some_random: # TODO this only works for the print if it's the last epoch.
                 #action = torch.tensor([random.randint(0, logits.size(-1) - 1)], device=device)
                 action = random.choice(["x", "a", "b"])
                 action = torch.tensor([tokenizer.token_to_id[action]], device=device)
@@ -548,14 +558,20 @@ def collect_trajectories(policy_net, value_net, prompts,
 
             iterations -= 1
             seq_text = tokenizer.decode(int_seq)
-            good_chars = 0.0#seq_text.count("aa")# + seq_text.count("c") + seq_text.count("d") - prompt.count("b") - prompt.count("c") - prompt.count("d")#+ prompt.count("e")
-            bad_chars = seq_text.count("ba")# (2*seq_text.count("bbx")) + (1.1*seq_text.count("abx ")) + (1.2*seq_text.count("bax "))
-            bad_chars -= prompt.count("ba")# (1.9*prompt.count("bbx")) + (1.09*prompt.count("abx ")) + (1.15*prompt.count("bax "))
-            all_chars = set(seq_text)
-            unique_chars = len(all_chars)
+            gen_text = seq_text.replace(prompt, "")
+            good_chars = 0.0
+            bad_chars = ((0.5*gen_text.count("a")) + (0.5*gen_text.count("b"))) * (1 + gen_text.count("a b"))# (2*seq_text.count("bbx")) + (1.1*seq_text.count("abx ")) + (1.2*seq_text.count("bax "))
+            
+            # if "a b" not in gen_text:
+            #     bad_chars /= 10
+
             if iterations == 0:
-                num_whitespaces = (seq_text.count(" ") + seq_text.count("\n"))
-                reward = (bad_chars * 4) - good_chars + 0.5
+                reward = bad_chars
+                if len(gen_text) > 1 and gen_text[-1] == gen_text[-2]:
+                        reward -= 0.2
+                if len(gen_text) > 2 and gen_text[-1] == gen_text[-3]:
+                    reward -= 0.2
+                #reward = max(min(reward, 1.0), -1.0)
                 rewards_.append(reward)
                 if len(actions_) < total_length:
                     #print("ERROR")
@@ -566,9 +582,6 @@ def collect_trajectories(policy_net, value_net, prompts,
                     rewards_ += [0.0 for _ in range(total_length - len(rewards_))]
                 if len(log_probs_) < total_length:
                     log_probs_ += [torch.tensor([0.0], device=device) for _ in range(total_length - len(log_probs_))]
-                # if len(values_) < total_length:
-                #     print("ERROR4")
-                #     values_ += [torch.tensor([0.0], device=device) for _ in range(total_length - len(values_))]
 
                 actions_ = torch.stack(actions_)
                 rewards_ = torch.tensor(rewards_, device=device).unsqueeze(-1)
@@ -579,26 +592,41 @@ def collect_trajectories(policy_net, value_net, prompts,
                 assert mask_tensor.size(1) == seq_tensor.size(1)
                 assert log_probs_.size(0) == seq_tensor.size(1)
                 assert values_.size(1) == seq_tensor.size(1)
-                trajectories.append((seq_tensor, actions_, rewards_, mask_tensor, log_probs_, values_)) ########## NEWWWWWW
-                if "ba" in seq_text and not "ba" in prompt:
-                    randtext = "YES RANDOM" if got_some_random else "NO RANDOM"
-                    print(f"GOT ba!! {seq_text} ({prompt}) -- {randtext}")
+                trajectories.append([seq_tensor, actions_, rewards_, mask_tensor, log_probs_, values_]) ########## NEWWWWWW
                 avg_reward += sum(rewards_)
+                cleantext = gen_text.replace('\n', '!')
+                print(f"Prompt: {prompt}, Sequence: {cleantext}, Reward: {reward}, Cum reward: {rewards_.sum().item()}")
             else:
-                ba_reward = actions_[-1] == tokenizer.token_to_id["b"] and actions_[-2] == tokenizer.token_to_id["a"]
-                if ba_reward:
+                # ba_reward = actions_[-1] == tokenizer.token_to_id["a"] and actions_[-2] == tokenizer.token_to_id["b"]
+                if False:#ba_reward:
                     rewards_.append(0.5)
                 else:
-                    rewards_.append(0.0)#0.5 if actions_[-1] != actions_[-2] else -0.1)
+                    reward = 0.1 if tokenizer.id_to_token[action.item()] in [" ", "a", "b"] else -1.0
+                    if len(gen_text) > 1 and gen_text[-1] == gen_text[-2]:
+                        reward -= 0.2
+                    if len(gen_text) > 2 and gen_text[-1] == gen_text[-3]:
+                        reward -= 0.2
+                    # if actions_[-1].item() == actions_[-2].item():
+                    #     reward -= 0.2
+                    #reward = 0.0
+                    #reward = max(min(reward, 1.0), -1.0)
+                    rewards_.append(reward)
         
     avg_reward /= len(prompts)
     print(f"Average reward: {avg_reward.item()}")
+
+    # scale rewards 0 - 1
+    max_reward = max([x[2].max().item() for x in trajectories])
+    min_reward = min([x[2].min().item() for x in trajectories])
+    for t in trajectories:
+        t[2] = (t[2] - min_reward) / (max_reward - min_reward)
 
     return trajectories
 
 
 policy_net = PolicyNetwork(model).to(device)
-value_net = ValueNetwork(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)# ValueNetwork(model).to(device)#
+#value_net = ValueNetwork(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)
+value_net = ValueNetwork(model).to(device)
 
 # Initialize PPO
 ppo = PPO(policy_net, value_net, update_epochs=4, batch_size=12)
@@ -613,18 +641,19 @@ prompts = [
     "\nab",
     "\nba",
     "\na b x",
-    "\na ",
+    # "\na ",
     "w x y z",
-    "r s t u v",
-    "u v w x y z\naa",
-    "a b aax abx",
-    "a b aa",
-    "a b aax aa",
-    "abc def bax aax",
-]*4
+    "z\n",
+    "start",
+    # "reverse",
+    "front",
+    # "back",
+    # "rear",
+    "forward"
+]*2
 assert ppo.batch_size <= len(prompts)
 
-num_epochs = 155
+num_epochs = 90
 try:
     for epoch in range(num_epochs):
         trajectories = collect_trajectories(policy_net, value_net, prompts, epoch)
@@ -638,49 +667,3 @@ try:
         print(generate(p, 35, temperature=1.0))
 except KeyboardInterrupt:
     pass
-
-
-def generate_no_beam(policy_net, prompt,
-                     max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS_AT_A_TIME,
-                     total_length=TOTAL_SEQUENCE_LENGTH,
-                     temperature=1.0):
-
-    int_seq = tokenizer.tokenize(prompt) 
-    
-    iterations = max_len - len(int_seq)
-    while iterations > 0:
-        true_seq = deepcopy(int_seq)   
-        mask = [1] * len(int_seq) + [0] * (total_length - len(int_seq))
-        if len(int_seq) < total_length:
-            int_seq += [PADDING_IDX] * (total_length - len(int_seq))
-        elif len(int_seq) >= total_length:
-            int_seq = int_seq[1:total_length - PREDICT_N_TOKENS_AT_A_TIME]
-            mask = [1] * len(int_seq) + [0] * (total_length - len(int_seq))
-            int_seq += [PADDING_IDX] * (total_length - len(int_seq))
-        
-        seq_tensor = torch.tensor([int_seq], device=device).reshape(1, len(int_seq), 1)
-        mask_tensor = torch.tensor([mask], device=device).reshape(1, len(mask), 1)
-        
-        assert len(int_seq) == len(mask)
-        assert mask_tensor.view(-1)[-1] == 0
-
-        with torch.no_grad():
-            output = policy_net(seq_tensor, mask_tensor)
-
-        output = output.squeeze(0)
-        relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
-        logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
-        
-        dist = Categorical(logits=logits / temperature)
-        action = dist.sample()
-        int_seq = true_seq + action.tolist()
-        
-        iterations -= 1
-        if iterations == 0:
-            seq_text = tokenizer.decode(int_seq)
-            return seq_text
-
-for p in prompts:
-    print("-----")
-    print(generate_no_beam(policy_net, p, max_len=50, temperature=1.0))
-    print("-----")
