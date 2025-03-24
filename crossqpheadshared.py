@@ -1,6 +1,7 @@
 import random
 from collections import Counter
 from copy import deepcopy
+import re
 
 import torch
 
@@ -23,6 +24,7 @@ front a b c d e f g h i j k l m n o p q r s t u v w x y z
 start a b c d e f g h i j k l m n o p q r s t u v w x y z
 forward a b c d e f g h i j k l m n o p q r s t u v w x y z
 a b c d e f g h i j k l m n o p q r s t u v w x y z
+repeat a b a b c d c d e f e f g h g h i j i j
 """
 # reverse z y x w v u t s r q p o n m l k j i h g f e d c b a
 # back z y x w v u t s r q p o n m l k j i h g f e d c b a
@@ -324,11 +326,14 @@ def generate(prompt, iterations=3,
     
     return [(x[2], round(x[1], 3)) for x in beams]
 
-print(generate("a b c", 25))
-print(generate("l m n o", 25))
-print(generate("z y x", 25))
-print(generate("forward", 25))
-print(generate("back", 25))
+try:
+    print(generate("a b c", 25))
+    print(generate("l m n o", 25))
+    print(generate("z y x", 25))
+    print(generate("forward", 25))
+    print(generate("back", 25))
+except KeyboardInterrupt:
+    pass
 
 #############################################
 model.train()
@@ -368,8 +373,8 @@ class ValueNetwork(torch.nn.Module):
 #         return value
 
 class PPO:
-    def __init__(self, policy_net, value_net, policy_lr=0.0001, value_lr=0.0001, gamma=0.998, clip_epsilon=0.2,
-                 update_epochs=10, batch_size=BATCH_SIZE, entropy_coef=0.01):
+    def __init__(self, policy_net, value_net, policy_lr=0.0001, value_lr=0.0001, gamma=0.99, clip_epsilon=0.2,
+                 update_epochs=10, batch_size=BATCH_SIZE, entropy_coef=0.0):
         self.policy_net = policy_net
         self.value_net = value_net
         self.policy_optimizer = torch.optim.Adam(policy_net.parameters(), lr=policy_lr)
@@ -399,14 +404,17 @@ class PPO:
         advantages[:, -1, :] = rewards[:, -1, :] - values[:, -1, :]
 
         for t in reversed(range(T - 1)):
-            returns[:, t, :] = rewards[:, t, :] + self.gamma * returns[:, t + 1, :] * masks[:, t + 1, :]
-            td_error = rewards[:, t, :] + self.gamma * values[:, t + 1, :] * masks[:, t + 1, :] - values[:, t, :]
+            # if t in [30, 29, 28]:
+            #     print(t, masks[0, t, :], returns[0, t+1, :])
+            #     print("---")
+            returns[:, t, :] = rewards[:, t, :] + self.gamma * returns[:, t + 1, :] * masks[:, t, :]
+            td_error = rewards[:, t, :] + self.gamma * values[:, t + 1, :] - values[:, t, :]
             # Use the below one and comment out masks for maskless (fail) version
             #td_error = rewards[:, t, :] + self.gamma * values[:, t + 1, :] - values[:, t, :]
-            advantages[:, t, :] = td_error + self.gamma * advantages[:, t + 1, :] * masks[:, t + 1, :]
+            advantages[:, t, :] = td_error + self.gamma * advantages[:, t + 1, :] * masks[:, t, :]
 
         # Normalize advantages
-        advantages = self.normalize(advantages)
+        # advantages = self.normalize(advantages)
 
         return advantages, returns
 
@@ -421,7 +429,7 @@ class PPO:
         batch_actions = torch.stack(actions, dim=0)
         batch_rewards = torch.stack(rewards, dim=0)
 
-        batch_rewards = self.normalize(batch_rewards)
+        #batch_rewards = self.normalize(batch_rewards)
         
         batch_masks = torch.stack(masks, dim=0).squeeze(1)
         batch_relevant_indices = [((mask == 1).nonzero(as_tuple=True)[0][-1].item() + 1) for mask in batch_masks]
@@ -441,15 +449,16 @@ class PPO:
 
                 logits = self.policy_net(batch_states, batch_masks)
                 
-                #these_logits = torch.gather(logits, 1, batch_relevant_indices.view(-1, 1, 1).expand(-1, -1, logits.size(-1)))  # correct
+                these_logits = torch.gather(logits, 1, batch_relevant_indices.view(-1, 1, 1).expand(-1, -1, logits.size(-1)))  # correct
                 # TODO this breaks PREDICT_N_TOKENS_AT_A_TIME > 1
-                dist = Categorical(logits=logits / TEMPERATURE)#these_logits / TEMPERATURE)
+                dist = Categorical(logits=these_logits / TEMPERATURE)#these_logits / TEMPERATURE)
 
                 log_probs = dist.log_prob(batch_actions.squeeze(-1))#.view_as(batch_old_log_probs)
                 ratio = torch.exp(log_probs.unsqueeze(-1) - batch_old_log_probs)
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
+
                 entropy = dist.entropy().mean()
                 policy_loss -= self.entropy_coef * entropy
 
@@ -486,11 +495,35 @@ def get_temperature(epoch, num_epochs, initial_temperature=6, final_temperature=
 def get_epsilon(epoch, num_epochs, initial_epsilon=0.3, final_epsilon=-1):
     return initial_epsilon + (final_epsilon - initial_epsilon) * (epoch / num_epochs)
 
+def calculate_ab_reward(seq_text, base_reward=1.0, whitespace_penalty=0.1):
+    pattern = r"b\s*c"
+    matches = re.finditer(pattern, seq_text)
+    reward = 0
+    for match in matches:
+        num_whitespaces = match.group().count(" ")
+        if num_whitespaces == 0:
+            reward = base_reward - (2 * whitespace_penalty)
+        elif num_whitespaces == 1:
+            reward = base_reward
+        else:
+            reward += base_reward - (num_whitespaces * whitespace_penalty)
+    return reward
+
+def count_substring_sliding(text, sub):
+    if not sub:
+        return 0
+
+    count = 0
+    for i in range(len(text) - len(sub) + 1):
+        if text[i:i + len(sub)] == sub:
+            count += 1
+    return count
+
 def collect_trajectories(policy_net, value_net, prompts,
                          epoch,
                          max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS_AT_A_TIME,
                          total_length=TOTAL_SEQUENCE_LENGTH,
-                         epsilon=0.3):#0.3):#-float("inf")):
+                         epsilon=-1): # or -1 for no epsilon exploration
     global next_temp, num_epochs, TEMPERATURE
     
     trajectories = []
@@ -517,7 +550,7 @@ def collect_trajectories(policy_net, value_net, prompts,
         log_probs_ += [torch.tensor([0.0], device=device) for x in prompt]
         
         iterations = TOTAL_SEQUENCE_LENGTH - len(int_seq) - PREDICT_N_TOKENS_AT_A_TIME
-        while iterations > 0:
+        while iterations > -1:
             true_seq = deepcopy(int_seq)   
             mask = [1] * len(int_seq) + [0] * (total_length - len(int_seq))
             if len(int_seq) < total_length:
@@ -542,7 +575,7 @@ def collect_trajectories(policy_net, value_net, prompts,
             dist = Categorical(logits=logits / TEMPERATURE)
 
             got_some_random = random.random() < this_epsilon
-            if False:#got_some_random: # TODO this only works for the print if it's the last epoch.
+            if got_some_random:
                 #action = torch.tensor([random.randint(0, logits.size(-1) - 1)], device=device)
                 action = random.choice(["x", "a", "b"])
                 action = torch.tensor([tokenizer.token_to_id[action]], device=device)
@@ -560,28 +593,27 @@ def collect_trajectories(policy_net, value_net, prompts,
             seq_text = tokenizer.decode(int_seq)
             gen_text = seq_text.replace(prompt, "")
             good_chars = 0.0
-            bad_chars = ((0.5*gen_text.count("a")) + (0.5*gen_text.count("b"))) * (1 + gen_text.count("a b"))# (2*seq_text.count("bbx")) + (1.1*seq_text.count("abx ")) + (1.2*seq_text.count("bax "))
-            
-            # if "a b" not in gen_text:
-            #     bad_chars /= 10
+            #bad_chars = ((0.5*gen_text.count("b")) + (0.4*gen_text.count("c"))) + (7 * gen_text.count("b c"))# (2*seq_text.count("bbx")) + (1.1*seq_text.count("abx ")) + (1.2*seq_text.count("bax "))
+            bad_chars = gen_text.count("b c")
 
-            if iterations == 0:
-                reward = bad_chars
-                if len(gen_text) > 1 and gen_text[-1] == gen_text[-2]:
-                        reward -= 0.2
-                if len(gen_text) > 2 and gen_text[-1] == gen_text[-3]:
-                    reward -= 0.2
+            if iterations == -1:
+                reward = bad_chars + calculate_ab_reward(gen_text)
+                # reward -= count_substring_sliding(gen_text, "cc") * 0.5
+                # reward -= count_substring_sliding(gen_text, "tt") * 0.5
+                # reward -= count_substring_sliding(gen_text, "aa") * 0.5
+                # reward -= count_substring_sliding(gen_text, "bb") * 0.5
+                # if len(gen_text) > 1 and gen_text[-1] == gen_text[-2]:
+                #         reward -= 0.2
+                # if len(gen_text) > 2 and gen_text[-1] == gen_text[-3]:
+                #     reward -= 0.2
+                # if "   " in gen_text:
+                #     reward = -10.0
                 #reward = max(min(reward, 1.0), -1.0)
+                
+                
+                
+                reward += sum(rewards_)
                 rewards_.append(reward)
-                if len(actions_) < total_length:
-                    #print("ERROR")
-                    actions_ += [torch.tensor([tokenizer.token_to_id["#"]], device=device) for _ in range(total_length - len(actions_))]
-                if len(rewards_) < total_length:
-                    #print("ERROR2")
-                    orig_rewards = deepcopy(rewards_)
-                    rewards_ += [0.0 for _ in range(total_length - len(rewards_))]
-                if len(log_probs_) < total_length:
-                    log_probs_ += [torch.tensor([0.0], device=device) for _ in range(total_length - len(log_probs_))]
 
                 actions_ = torch.stack(actions_)
                 rewards_ = torch.tensor(rewards_, device=device).unsqueeze(-1)
@@ -592,34 +624,43 @@ def collect_trajectories(policy_net, value_net, prompts,
                 assert mask_tensor.size(1) == seq_tensor.size(1)
                 assert log_probs_.size(0) == seq_tensor.size(1)
                 assert values_.size(1) == seq_tensor.size(1)
+
+                # normalize reward NO NOT HERE! DO IT ON THE BATCH, BELOW!
+                # max_reward = max(rewards_)
+                # min_reward = min(rewards_)
+                # rewards_ = [(x - min_reward) / (max_reward - min_reward) for x in rewards_]
+                # rewards_ = torch.tensor(rewards_, device=device).unsqueeze(-1)
+
                 trajectories.append([seq_tensor, actions_, rewards_, mask_tensor, log_probs_, values_]) ########## NEWWWWWW
                 avg_reward += sum(rewards_)
                 cleantext = gen_text.replace('\n', '!')
                 print(f"Prompt: {prompt}, Sequence: {cleantext}, Reward: {reward}, Cum reward: {rewards_.sum().item()}")
             else:
-                # ba_reward = actions_[-1] == tokenizer.token_to_id["a"] and actions_[-2] == tokenizer.token_to_id["b"]
-                if False:#ba_reward:
-                    rewards_.append(0.5)
-                else:
-                    reward = 0.1 if tokenizer.id_to_token[action.item()] in [" ", "a", "b"] else -1.0
-                    if len(gen_text) > 1 and gen_text[-1] == gen_text[-2]:
-                        reward -= 0.2
-                    if len(gen_text) > 2 and gen_text[-1] == gen_text[-3]:
-                        reward -= 0.2
-                    # if actions_[-1].item() == actions_[-2].item():
-                    #     reward -= 0.2
-                    #reward = 0.0
-                    #reward = max(min(reward, 1.0), -1.0)
-                    rewards_.append(reward)
+                
+                if len(actions_) == 0:
+                    ba_reward = 0.0
+                elif len(actions_) == 1:
+                    ba_reward = 0.0#0.1 if actions_[-1] == tokenizer.token_to_id["b"] else 0.0
+                elif len(actions_) == 2:
+                    ba_reward = 0.0#0.5 if actions_[-1] == tokenizer.token_to_id[" "] and actions_[-2] == tokenizer.token_to_id["b"] else 0.0
+                elif len(actions_) > 2:
+                    if actions_[-1] == tokenizer.token_to_id["c"] and actions_[-2] == tokenizer.token_to_id[" "] and actions_[-3] == tokenizer.token_to_id["b"]:
+                        ba_reward = 2.0
+                    else:
+                        ba_reward = 0.0
+
+                reward = ba_reward
+                # reward = 0.1 if tokenizer.id_to_token[action.item()] in [" ", "a", "b"] else -1.0
+                rewards_.append(reward)
         
     avg_reward /= len(prompts)
     print(f"Average reward: {avg_reward.item()}")
 
-    # scale rewards 0 - 1
-    max_reward = max([x[2].max().item() for x in trajectories])
-    min_reward = min([x[2].min().item() for x in trajectories])
-    for t in trajectories:
-        t[2] = (t[2] - min_reward) / (max_reward - min_reward)
+    # max_reward = max([x[2].max().item() for x in trajectories])
+    # min_reward = min([x[2].min().item() for x in trajectories])
+    # for t in trajectories:
+    #     # t[2] = 2 * (t[2] - min_reward) / (max_reward - min_reward) - 1 # -1 to +1
+    #     t[2] = (t[2] - min_reward) / (max_reward - min_reward) # 0 to 1
 
     return trajectories
 
@@ -637,10 +678,6 @@ prompts = [
     "hi hi hi",
     "h i",
     "c d e f g",
-    "abx",
-    "\nab",
-    "\nba",
-    "\na b x",
     # "\na ",
     "w x y z",
     "z\n",
@@ -649,11 +686,17 @@ prompts = [
     "front",
     # "back",
     # "rear",
-    "forward"
-]*2
+    "forward",
+    "repeat",
+    "repea",
+    "repeat "
+]*16
 assert ppo.batch_size <= len(prompts)
 
-num_epochs = 90
+# model.train()
+# policy_net.train()
+# value_net.train()
+num_epochs = 200
 try:
     for epoch in range(num_epochs):
         trajectories = collect_trajectories(policy_net, value_net, prompts, epoch)
@@ -662,6 +705,9 @@ try:
 except KeyboardInterrupt:
     pass
 
+model.eval()
+policy_net.eval()
+value_net.eval()
 try:
     for p in prompts:
         print(generate(p, 35, temperature=1.0))
