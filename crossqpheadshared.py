@@ -25,6 +25,7 @@ start a b c d e f g h i j k l m n o p q r s t u v w x y z
 forward a b c d e f g h i j k l m n o p q r s t u v w x y z
 a b c d e f g h i j k l m n o p q r s t u v w x y z
 repeat a b a b c d c d e f e f g h g h i j i j
+go a b c a b c a b c a b c a b c a b c a b c a b c a b c a b c
 """
 # reverse z y x w v u t s r q p o n m l k j i h g f e d c b a
 # back z y x w v u t s r q p o n m l k j i h g f e d c b a
@@ -395,23 +396,17 @@ class PPO:
         return ((tensor - mean) / (std + 1e-8))#.tolist()
 
     def compute_advantages(self, rewards, values, masks):
+        # I have validated this works as intended, at least returns does.
         B, T, _ = rewards.shape
         advantages = torch.zeros_like(rewards, device=device)
         returns = torch.zeros_like(rewards, device=device)
-
-        # Initialize the last return with the last reward
         returns[:, -1, :] = rewards[:, -1, :]
         advantages[:, -1, :] = rewards[:, -1, :] - values[:, -1, :]
 
         for t in reversed(range(T - 1)):
-            # if t in [30, 29, 28]:
-            #     print(t, masks[0, t, :], returns[0, t+1, :])
-            #     print("---")
-            returns[:, t, :] = rewards[:, t, :] + self.gamma * returns[:, t + 1, :] * masks[:, t, :]
+            returns[:, t, :] = rewards[:, t, :] + self.gamma * returns[:, t + 1, :]
             td_error = rewards[:, t, :] + self.gamma * values[:, t + 1, :] - values[:, t, :]
-            # Use the below one and comment out masks for maskless (fail) version
-            #td_error = rewards[:, t, :] + self.gamma * values[:, t + 1, :] - values[:, t, :]
-            advantages[:, t, :] = td_error + self.gamma * advantages[:, t + 1, :] * masks[:, t, :]
+            advantages[:, t, :] = td_error + self.gamma * advantages[:, t + 1, :]
 
         # Normalize advantages
         # advantages = self.normalize(advantages)
@@ -467,16 +462,18 @@ class PPO:
                 # value_loss = (returns - value).pow(2).mean()
                 # This seems more correct but doesn't work
                 # value_loss = (returns - value.squeeze(-1).mean(-1)).pow(2).mean()
+                
                 value_loss = (returns - value).pow(2).mean()
+                #value_loss = (returns[:, -1, :] - value[:, -1, :]).pow(2).mean()
                 
                 self.value_optimizer.zero_grad()
                 value_loss.backward()#retain_graph=True)
-                #torch.nn.utils.clip_grad_norm_(value_net.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_(value_net.parameters(), 0.5)
                 self.value_optimizer.step()
                 self.policy_optimizer.zero_grad()
                 #self.optimizer.zero_grad()
                 policy_loss.backward()
-                #torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 0.5)
                 self.policy_optimizer.step()
                 #(policy_loss + value_loss).backward()
                 #torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -531,7 +528,7 @@ def collect_trajectories(policy_net, value_net, prompts,
     avg_reward = 0.0
     TEMPERATURE = 1.0#get_temperature(epoch, num_epochs)
     print(f"Temperature: {TEMPERATURE}")
-    this_epsilon = get_epsilon(epoch, num_epochs, initial_epsilon=epsilon)
+    this_epsilon = -1#get_epsilon(epoch, num_epochs, initial_epsilon=epsilon)
     print(f"Epsilon: {this_epsilon}")
 
     for prompt in prompts:
@@ -569,7 +566,7 @@ def collect_trajectories(policy_net, value_net, prompts,
                 value = value_net(seq_tensor, mask_tensor)
 
             output = output.squeeze(0)
-            relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
+            relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() #+ 1 remove this +1 and in the other ppo stuff, let it be 0
             logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
             
             dist = Categorical(logits=logits / TEMPERATURE)
@@ -594,7 +591,7 @@ def collect_trajectories(policy_net, value_net, prompts,
             gen_text = seq_text.replace(prompt, "")
             good_chars = 0.0
             #bad_chars = ((0.5*gen_text.count("b")) + (0.4*gen_text.count("c"))) + (7 * gen_text.count("b c"))# (2*seq_text.count("bbx")) + (1.1*seq_text.count("abx ")) + (1.2*seq_text.count("bax "))
-            bad_chars = gen_text.count("b c")
+            bad_chars = gen_text.count("b c") * 3
 
             if iterations == -1:
                 reward = bad_chars + calculate_ab_reward(gen_text)
@@ -612,8 +609,8 @@ def collect_trajectories(policy_net, value_net, prompts,
                 
                 
                 
-                reward += sum(rewards_)
-                rewards_.append(reward)
+                #reward += sum(rewards_) # DONT REINSTATE THIS, IT SHOULD WORK WITHOUT IT
+                rewards_.append(float(reward))
 
                 actions_ = torch.stack(actions_)
                 rewards_ = torch.tensor(rewards_, device=device).unsqueeze(-1)
@@ -645,13 +642,15 @@ def collect_trajectories(policy_net, value_net, prompts,
                     ba_reward = 0.0#0.5 if actions_[-1] == tokenizer.token_to_id[" "] and actions_[-2] == tokenizer.token_to_id["b"] else 0.0
                 elif len(actions_) > 2:
                     if actions_[-1] == tokenizer.token_to_id["c"] and actions_[-2] == tokenizer.token_to_id[" "] and actions_[-3] == tokenizer.token_to_id["b"]:
-                        ba_reward = 2.0
+                        ba_reward = 0.1
                     else:
                         ba_reward = 0.0
+                if actions_[-1] not in [" ", "b", "c"]:
+                    ba_reward = -0.01
 
                 reward = ba_reward
                 # reward = 0.1 if tokenizer.id_to_token[action.item()] in [" ", "a", "b"] else -1.0
-                rewards_.append(reward)
+                rewards_.append(float(reward))
         
     avg_reward /= len(prompts)
     print(f"Average reward: {avg_reward.item()}")
@@ -670,7 +669,7 @@ policy_net = PolicyNetwork(model).to(device)
 value_net = ValueNetwork(model).to(device)
 
 # Initialize PPO
-ppo = PPO(policy_net, value_net, update_epochs=4, batch_size=12)
+ppo = PPO(policy_net, value_net, update_epochs=6, batch_size=10)
 
 prompts = [
     "a",
@@ -689,8 +688,18 @@ prompts = [
     "forward",
     "repeat",
     "repea",
-    "repeat "
-]*16
+    "repeat ",
+    "fo",
+    "for",
+    "z\na",
+    "z\na ",
+    "\na",
+    "v w x y z",
+    "u v w x y z\n",
+    "go a",
+    "go a ",
+    "\ngo"
+]
 assert ppo.batch_size <= len(prompts)
 
 # model.train()
