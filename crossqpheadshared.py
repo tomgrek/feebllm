@@ -566,7 +566,7 @@ def collect_trajectories(policy_net, value_net, prompts,
                 value = value_net(seq_tensor, mask_tensor)
 
             output = output.squeeze(0)
-            relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() #+ 1 remove this +1 and in the other ppo stuff, let it be 0
+            relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item()# + 1 #remove this +1 and in the other ppo stuff, let it be 0
             logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
             
             dist = Categorical(logits=logits / TEMPERATURE)
@@ -702,9 +702,9 @@ prompts = [
 ]
 assert ppo.batch_size <= len(prompts)
 
-# model.train()
-# policy_net.train()
-# value_net.train()
+model.train()
+policy_net.train()
+value_net.train()
 num_epochs = 200
 try:
     for epoch in range(num_epochs):
@@ -722,3 +722,49 @@ try:
         print(generate(p, 35, temperature=1.0))
 except KeyboardInterrupt:
     pass
+
+
+def generate_no_beam(policy_net, prompt,
+                     max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS_AT_A_TIME,
+                     total_length=TOTAL_SEQUENCE_LENGTH,
+                     temperature=1.0):
+
+    int_seq = tokenizer.tokenize(prompt) 
+    
+    iterations = max_len - len(int_seq)
+    while iterations > 0:
+        true_seq = deepcopy(int_seq)   
+        mask = [1] * len(int_seq) + [0] * (total_length - len(int_seq))
+        if len(int_seq) < total_length:
+            int_seq += [PADDING_IDX] * (total_length - len(int_seq))
+        elif len(int_seq) >= total_length:
+            int_seq = int_seq[1:total_length - PREDICT_N_TOKENS_AT_A_TIME]
+            mask = [1] * len(int_seq) + [0] * (total_length - len(int_seq))
+            int_seq += [PADDING_IDX] * (total_length - len(int_seq))
+        
+        seq_tensor = torch.tensor([int_seq], device=device).reshape(1, len(int_seq), 1)
+        mask_tensor = torch.tensor([mask], device=device).reshape(1, len(mask), 1)
+        
+        assert len(int_seq) == len(mask)
+        assert mask_tensor.view(-1)[-1] == 0
+
+        with torch.no_grad():
+            output = policy_net(seq_tensor, mask_tensor)
+
+        output = output.squeeze(0)
+        relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
+        logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
+        
+        dist = Categorical(logits=logits / temperature)
+        action = dist.sample()
+        int_seq = true_seq + action.tolist()
+        
+        iterations -= 1
+        if iterations == 0:
+            seq_text = tokenizer.decode(int_seq)
+            return seq_text
+
+for p in prompts:
+    print("-----")
+    print(generate_no_beam(policy_net, p, max_len=50, temperature=1.0))
+    print("-----")
