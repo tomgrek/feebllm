@@ -446,7 +446,7 @@ class PPO:
                 
                 these_logits = torch.gather(logits, 1, batch_relevant_indices.view(-1, 1, 1).expand(-1, -1, logits.size(-1)))  # correct
                 # TODO this breaks PREDICT_N_TOKENS_AT_A_TIME > 1
-                dist = Categorical(logits=these_logits / TEMPERATURE)#these_logits / TEMPERATURE)
+                dist = Categorical(logits=torch.nn.functional.log_softmax(these_logits / TEMPERATURE, dim=-1))#these_logits / TEMPERATURE)
 
                 log_probs = dist.log_prob(batch_actions.squeeze(-1))#.view_as(batch_old_log_probs)
                 ratio = torch.exp(log_probs.unsqueeze(-1) - batch_old_log_probs)
@@ -724,6 +724,9 @@ except KeyboardInterrupt:
     pass
 
 
+# Beam search doesn't directly sample the policy in the same way as the PPO training loop
+# so it's not directly comparable; the below method is more accurate.
+
 def generate_no_beam(policy_net, prompt,
                      max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS_AT_A_TIME,
                      total_length=TOTAL_SEQUENCE_LENGTH,
@@ -755,7 +758,7 @@ def generate_no_beam(policy_net, prompt,
         relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
         logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
         
-        dist = Categorical(logits=logits / temperature)
+        dist = Categorical(torch.nn.functional.log_softmax(logits=logits / temperature, dim=-1))
         action = dist.sample()
         int_seq = true_seq + action.tolist()
         
