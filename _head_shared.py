@@ -1,7 +1,6 @@
 import random
 from collections import Counter
 from copy import deepcopy
-import re
 
 import torch
 
@@ -12,7 +11,7 @@ torch.manual_seed(0)
 random.seed(0)
 
 PADDING_IDX = 0
-TOTAL_SEQUENCE_LENGTH = 30
+TOTAL_SEQUENCE_LENGTH = 20
 PREDICT_N_TOKENS_AT_A_TIME = 1
 MAX_VOCAB_SIZE = 29 # Must be <= number of tokens in the corpus
 BATCH_SIZE = 128  # Max, will use smaller batches sometimes
@@ -20,16 +19,18 @@ TEMPERATURE = 1.3#5
 next_temp = TEMPERATURE
 
 corpus = """
-front a b c d e f g h i j k l m n o p q r s t u v w x y z
-start a b c d e f g h i j k l m n o p q r s t u v w x y z
-forward a b c d e f g h i j k l m n o p q r s t u v w x y z
 a b c d e f g h i j k l m n o p q r s t u v w x y z
-repeat a b a b c d c d e f e f g h g h i j i j
-go a b c a b c a b c a b c a b c a b c a b c a b c a b c a b c
+a b c d e f g h i j k l m n o p q r s t u v w x y z
+a b c d e f g h i j k l m n o p q r s t u v w x y z
+ab
+ab
+ab
+ab ab
+bababa ba ba ab ab ba
+ababbaba
+xab xab xab abx abx axb axb a x b b x a abx bax bax bax a b x
+xab xab xab abx abx axb axb a x b b x a abx bax bax bax a b x
 """
-# reverse z y x w v u t s r q p o n m l k j i h g f e d c b a
-# back z y x w v u t s r q p o n m l k j i h g f e d c b a
-# rear z y x w v u t s r q p o n m l k j i h g f e d c b a
 # ai hi hi hi hi hi hi hi hihihihihihi
 # Using # for padding so strip it
 corpus_tokens = corpus.replace("#", "").split()
@@ -255,7 +256,7 @@ examples = generate_data(10000, max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS
 model = Model(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)
 model.train()
 try:
-    train(model, examples, epochs=30, early_stop=0.7)
+    train(model, examples, epochs=30, early_stop=0.5)
 except KeyboardInterrupt:
     pass
 model.eval()
@@ -327,14 +328,28 @@ def generate(prompt, iterations=3,
     
     return [(x[2], round(x[1], 3)) for x in beams]
 
-try:
-    print(generate("a b c", 25))
-    print(generate("l m n o", 25))
-    print(generate("z y x", 25))
-    print(generate("forward", 25))
-    print(generate("back", 25))
-except KeyboardInterrupt:
-    pass
+print(generate("a b c", 25))
+print(generate("l m n o", 25))
+#print(generate("In some systems,", 25))
+# print(generate("The King", 25))
+# print(generate("feudal lords", 25))
+# print(generate("you peasant", 25))
+
+#### Find similar inputs by embedding
+# embeddings = {}
+# for char in tokenizer.token_to_id:
+#     seq = torch.tensor([[tokenizer.token_to_id[char]]], device=device).reshape(1, 1, 1)
+#     embedding = model.embedding(seq)
+#     embeddings[char] = {"embedding": embedding.view(-1), "most_similar": []}
+# for char in embeddings:
+#     for other_char in embeddings:
+#         if char == other_char:
+#             continue
+#         sim = torch.nn.functional.cosine_similarity(embeddings[char]["embedding"], embeddings[other_char]["embedding"], dim=0)
+#         #print(f"Similarity between {char} and {other_char}: {sim.item()}")
+#         embeddings[char]["most_similar"].append((other_char, sim.item()))
+#     embeddings[char]["most_similar"] = sorted(embeddings[char]["most_similar"], key=lambda x: x[1], reverse=True)
+#     print(f"Most similar to {char}: {embeddings[char]['most_similar'][:3]}")
 
 #############################################
 model.train()
@@ -374,8 +389,8 @@ class ValueNetwork(torch.nn.Module):
 #         return value
 
 class PPO:
-    def __init__(self, policy_net, value_net, policy_lr=0.0001, value_lr=0.0001, gamma=0.99, clip_epsilon=0.2,
-                 update_epochs=10, batch_size=BATCH_SIZE, entropy_coef=0.0):
+    def __init__(self, policy_net, value_net, policy_lr=0.01, value_lr=0.0001, gamma=0.99, clip_epsilon=0.2,
+                 update_epochs=10, batch_size=BATCH_SIZE):
         self.policy_net = policy_net
         self.value_net = value_net
         self.policy_optimizer = torch.optim.Adam(policy_net.parameters(), lr=policy_lr)
@@ -387,7 +402,6 @@ class PPO:
         self.clip_epsilon = clip_epsilon
         self.update_epochs = update_epochs
         self.batch_size = batch_size
-        self.entropy_coef = entropy_coef
     
     def normalize(self, tensor):
         # tensor = torch.tensor(tensor, device=device)
@@ -396,22 +410,23 @@ class PPO:
         return ((tensor - mean) / (std + 1e-8))#.tolist()
 
     def compute_advantages(self, rewards, values, masks):
-        # I have validated this works as intended, at least returns does.
         B, T, _ = rewards.shape
         advantages = torch.zeros_like(rewards, device=device)
         returns = torch.zeros_like(rewards, device=device)
+
+        # Initialize the last return with the last reward
         returns[:, -1, :] = rewards[:, -1, :]
         advantages[:, -1, :] = rewards[:, -1, :] - values[:, -1, :]
 
         for t in reversed(range(T - 1)):
-            returns[:, t, :] = rewards[:, t, :] + self.gamma * returns[:, t + 1, :]
-            td_error = rewards[:, t, :] + self.gamma * values[:, t + 1, :] - values[:, t, :]
-            advantages[:, t, :] = td_error + self.gamma * advantages[:, t + 1, :]
+            returns[:, t, :] = rewards[:, t, :] + self.gamma * returns[:, t + 1, :] * masks[:, t + 1, :]
+            td_error = rewards[:, t, :] + self.gamma * values[:, t + 1, :] * masks[:, t + 1, :] - values[:, t, :]
+            advantages[:, t, :] = td_error + self.gamma * advantages[:, t + 1, :] * masks[:, t + 1, :]
 
         # Normalize advantages
-        # advantages = self.normalize(advantages)
+        #advantages = self.normalize(advantages)
 
-        return advantages, returns
+        return self.normalize(advantages), self.normalize(returns)
 
     def get_batch(self, trajectories):
         # TODO this returns 1 trajectory for every generation up to seqlen
@@ -424,7 +439,7 @@ class PPO:
         batch_actions = torch.stack(actions, dim=0)
         batch_rewards = torch.stack(rewards, dim=0)
 
-        #batch_rewards = self.normalize(batch_rewards)
+        batch_rewards = self.normalize(batch_rewards)
         
         batch_masks = torch.stack(masks, dim=0).squeeze(1)
         batch_relevant_indices = [((mask == 1).nonzero(as_tuple=True)[0][-1].item() + 1) for mask in batch_masks]
@@ -444,30 +459,26 @@ class PPO:
 
                 logits = self.policy_net(batch_states, batch_masks)
                 
-                these_logits = torch.gather(logits, 1, batch_relevant_indices.view(-1, 1, 1).expand(-1, -1, logits.size(-1)))  # correct
+                #these_logits = torch.gather(logits, 1, batch_relevant_indices.view(-1, 1, 1).expand(-1, -1, logits.size(-1)))  # correct
                 # TODO this breaks PREDICT_N_TOKENS_AT_A_TIME > 1
-                dist = Categorical(logits=torch.nn.functional.log_softmax(these_logits / TEMPERATURE, dim=-1))#these_logits / TEMPERATURE)
+                dist = Categorical(logits=logits / TEMPERATURE)#these_logits / TEMPERATURE)
 
                 log_probs = dist.log_prob(batch_actions.squeeze(-1))#.view_as(batch_old_log_probs)
                 ratio = torch.exp(log_probs.unsqueeze(-1) - batch_old_log_probs)
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
-
-                entropy = dist.entropy().mean()
-                policy_loss -= self.entropy_coef * entropy
-
                 value = self.value_net(batch_states, batch_masks)
+                value = self.normalize(value)
+                
                 # This works but value is bs x seqlen x 1 while returns is bs x 1
                 # value_loss = (returns - value).pow(2).mean()
                 # This seems more correct but doesn't work
                 # value_loss = (returns - value.squeeze(-1).mean(-1)).pow(2).mean()
-                
                 value_loss = (returns - value).pow(2).mean()
-                #value_loss = (returns[:, -1, :] - value[:, -1, :]).pow(2).mean()
                 
                 self.value_optimizer.zero_grad()
-                value_loss.backward()#retain_graph=True)
+                value_loss.backward(retain_graph=True)
                 torch.nn.utils.clip_grad_norm_(value_net.parameters(), 0.5)
                 self.value_optimizer.step()
                 self.policy_optimizer.zero_grad()
@@ -486,52 +497,29 @@ class PPO:
 
             print(f"Policy loss: {epoch_policy_loss}, Value loss: {epoch_value_loss}")
 
-def get_temperature(epoch, num_epochs, initial_temperature=6, final_temperature=-3.0):
+def get_temperature(epoch, num_epochs, initial_temperature=1.2, final_temperature=1.0):
     return initial_temperature + (final_temperature - initial_temperature) * (epoch / num_epochs)
 
 def get_epsilon(epoch, num_epochs, initial_epsilon=0.3, final_epsilon=-1):
     return initial_epsilon + (final_epsilon - initial_epsilon) * (epoch / num_epochs)
 
-def calculate_ab_reward(seq_text, base_reward=1.0, whitespace_penalty=0.1):
-    pattern = r"b\s*c"
-    matches = re.finditer(pattern, seq_text)
-    reward = 0
-    for match in matches:
-        num_whitespaces = match.group().count(" ")
-        if num_whitespaces == 0:
-            reward = base_reward - (2 * whitespace_penalty)
-        elif num_whitespaces == 1:
-            reward = base_reward
-        else:
-            reward += base_reward - (num_whitespaces * whitespace_penalty)
-    return reward
-
-def count_substring_sliding(text, sub):
-    if not sub:
-        return 0
-
-    count = 0
-    for i in range(len(text) - len(sub) + 1):
-        if text[i:i + len(sub)] == sub:
-            count += 1
-    return count
-
 def collect_trajectories(policy_net, value_net, prompts,
                          epoch,
                          max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS_AT_A_TIME,
                          total_length=TOTAL_SEQUENCE_LENGTH,
-                         epsilon=-1): # or -1 for no epsilon exploration
+                         epsilon=0.3):#0.3):#-float("inf")):
     global next_temp, num_epochs, TEMPERATURE
     
     trajectories = []
 
     avg_reward = 0.0
-    TEMPERATURE = 1.0#get_temperature(epoch, num_epochs)
+    TEMPERATURE = get_temperature(epoch, num_epochs)
     print(f"Temperature: {TEMPERATURE}")
-    this_epsilon = -1#get_epsilon(epoch, num_epochs, initial_epsilon=epsilon)
+    this_epsilon = get_epsilon(epoch, num_epochs, initial_epsilon=epsilon)
     print(f"Epsilon: {this_epsilon}")
 
-    for prompt in prompts:
+    for i, prompt in enumerate(prompts):
+        print(f"Prompt {i + 1}/{len(prompts)}")
         states_ = []
         actions_ = []
         rewards_ = []
@@ -547,7 +535,7 @@ def collect_trajectories(policy_net, value_net, prompts,
         log_probs_ += [torch.tensor([0.0], device=device) for x in prompt]
         
         iterations = TOTAL_SEQUENCE_LENGTH - len(int_seq) - PREDICT_N_TOKENS_AT_A_TIME
-        while iterations > -1:
+        while iterations > 0:
             true_seq = deepcopy(int_seq)   
             mask = [1] * len(int_seq) + [0] * (total_length - len(int_seq))
             if len(int_seq) < total_length:
@@ -566,15 +554,14 @@ def collect_trajectories(policy_net, value_net, prompts,
                 value = value_net(seq_tensor, mask_tensor)
 
             output = output.squeeze(0)
-            relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item()# + 1 #remove this +1 and in the other ppo stuff, let it be 0
+            relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
             logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
             
             dist = Categorical(logits=logits / TEMPERATURE)
 
-            got_some_random = random.random() < this_epsilon
-            if got_some_random:
+            if random.random() < this_epsilon:
                 #action = torch.tensor([random.randint(0, logits.size(-1) - 1)], device=device)
-                action = random.choice(["x", "a", "b"])
+                action = random.choice(["a", "b", "c"])
                 action = torch.tensor([tokenizer.token_to_id[action]], device=device)
                 log_prob = dist.log_prob(action) # This seems slightly better than 0.0 or -10 etc.
             else:
@@ -588,29 +575,27 @@ def collect_trajectories(policy_net, value_net, prompts,
 
             iterations -= 1
             seq_text = tokenizer.decode(int_seq)
-            gen_text = seq_text.replace(prompt, "")
-            good_chars = 0.0
-            #bad_chars = ((0.5*gen_text.count("b")) + (0.4*gen_text.count("c"))) + (7 * gen_text.count("b c"))# (2*seq_text.count("bbx")) + (1.1*seq_text.count("abx ")) + (1.2*seq_text.count("bax "))
-            bad_chars = gen_text.count("b c") * 3
-
-            if iterations == -1:
-                reward = bad_chars + calculate_ab_reward(gen_text)
-                # reward -= count_substring_sliding(gen_text, "cc") * 0.5
-                # reward -= count_substring_sliding(gen_text, "tt") * 0.5
-                # reward -= count_substring_sliding(gen_text, "aa") * 0.5
-                # reward -= count_substring_sliding(gen_text, "bb") * 0.5
-                # if len(gen_text) > 1 and gen_text[-1] == gen_text[-2]:
-                #         reward -= 0.2
-                # if len(gen_text) > 2 and gen_text[-1] == gen_text[-3]:
-                #     reward -= 0.2
-                # if "   " in gen_text:
-                #     reward = -10.0
-                #reward = max(min(reward, 1.0), -1.0)
-                
-                
-                
-                #reward += sum(rewards_) # DONT REINSTATE THIS, IT SHOULD WORK WITHOUT IT
-                rewards_.append(float(reward))
+            good_chars = 0.0#seq_text.count("b") + seq_text.count("c") + seq_text.count("d") - prompt.count("b") - prompt.count("c") - prompt.count("d")#+ prompt.count("e")
+            bad_chars = seq_text.count("bc")#(2*seq_text.count("bbx")) + (1.1*seq_text.count("abx ")) + (1.2*seq_text.count("bax "))
+            bad_chars -= prompt.count("bc")#(1.9*prompt.count("bbx")) + (1.09*prompt.count("abx ")) + (1.15*prompt.count("bax "))
+            all_chars = set(seq_text)
+            unique_chars = len(all_chars)
+            if iterations == 0:
+                num_whitespaces = (seq_text.count(" ") + seq_text.count("\n"))
+                reward = (bad_chars * 4) - good_chars
+                rewards_.append(reward)
+                if len(actions_) < total_length:
+                    #print("ERROR")
+                    actions_ += [torch.tensor([tokenizer.token_to_id["#"]], device=device) for _ in range(total_length - len(actions_))]
+                if len(rewards_) < total_length:
+                    #print("ERROR2")
+                    orig_rewards = deepcopy(rewards_)
+                    rewards_ += [0.0 for _ in range(total_length - len(rewards_))]
+                if len(log_probs_) < total_length:
+                    log_probs_ += [torch.tensor([0.0], device=device) for _ in range(total_length - len(log_probs_))]
+                # if len(values_) < total_length:
+                #     print("ERROR4")
+                #     values_ += [torch.tensor([0.0], device=device) for _ in range(total_length - len(values_))]
 
                 actions_ = torch.stack(actions_)
                 rewards_ = torch.tensor(rewards_, device=device).unsqueeze(-1)
@@ -621,55 +606,25 @@ def collect_trajectories(policy_net, value_net, prompts,
                 assert mask_tensor.size(1) == seq_tensor.size(1)
                 assert log_probs_.size(0) == seq_tensor.size(1)
                 assert values_.size(1) == seq_tensor.size(1)
-
-                # normalize reward NO NOT HERE! DO IT ON THE BATCH, BELOW!
-                # max_reward = max(rewards_)
-                # min_reward = min(rewards_)
-                # rewards_ = [(x - min_reward) / (max_reward - min_reward) for x in rewards_]
-                # rewards_ = torch.tensor(rewards_, device=device).unsqueeze(-1)
-
-                trajectories.append([seq_tensor, actions_, rewards_, mask_tensor, log_probs_, values_]) ########## NEWWWWWW
-                avg_reward += sum(rewards_)
-                cleantext = gen_text.replace('\n', '!')
-                print(f"Prompt: {prompt}, Sequence: {cleantext}, Reward: {reward}, Cum reward: {rewards_.sum().item()}")
+                trajectories.append((seq_tensor, actions_, rewards_, mask_tensor, log_probs_, values_)) ########## NEWWWWWW
+                if "bc" in seq_text:
+                    print(f"GOT bc!! {seq_text} ({prompt})")
+                avg_reward += sum(rewards_) + 0.5
             else:
-                
-                if len(actions_) == 0:
-                    ba_reward = 0.0
-                elif len(actions_) == 1:
-                    ba_reward = 0.0#0.1 if actions_[-1] == tokenizer.token_to_id["b"] else 0.0
-                elif len(actions_) == 2:
-                    ba_reward = 0.0#0.5 if actions_[-1] == tokenizer.token_to_id[" "] and actions_[-2] == tokenizer.token_to_id["b"] else 0.0
-                elif len(actions_) > 2:
-                    if actions_[-1] == tokenizer.token_to_id["c"] and actions_[-2] == tokenizer.token_to_id[" "] and actions_[-3] == tokenizer.token_to_id["b"]:
-                        ba_reward = 0.1
-                    else:
-                        ba_reward = 0.0
-                if actions_[-1] not in [" ", "b", "c"]:
-                    ba_reward = -0.01
 
-                reward = ba_reward
-                # reward = 0.1 if tokenizer.id_to_token[action.item()] in [" ", "a", "b"] else -1.0
-                rewards_.append(float(reward))
+                rewards_.append(0.5 if actions_[-1] != actions_[-2] else -0.1)
         
     avg_reward /= len(prompts)
     print(f"Average reward: {avg_reward.item()}")
-
-    # max_reward = max([x[2].max().item() for x in trajectories])
-    # min_reward = min([x[2].min().item() for x in trajectories])
-    # for t in trajectories:
-    #     # t[2] = 2 * (t[2] - min_reward) / (max_reward - min_reward) - 1 # -1 to +1
-    #     t[2] = (t[2] - min_reward) / (max_reward - min_reward) # 0 to 1
 
     return trajectories
 
 
 policy_net = PolicyNetwork(model).to(device)
-#value_net = ValueNetwork(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)
-value_net = ValueNetwork(model).to(device)
+value_net = ValueNetwork(model).to(device)#ValueNetwork(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)# 
 
 # Initialize PPO
-ppo = PPO(policy_net, value_net, update_epochs=6, batch_size=10)
+ppo = PPO(policy_net, value_net, update_epochs=30, batch_size=8)
 
 prompts = [
     "a",
@@ -677,35 +632,22 @@ prompts = [
     "hi hi hi",
     "h i",
     "c d e f g",
-    # "\na ",
+    "abx",
+    "\nab",
+    "\nba",
+    "\na b x",
+    "\na ",
     "w x y z",
-    "z\n",
-    "start",
-    # "reverse",
-    "front",
-    # "back",
-    # "rear",
-    "forward",
-    "repeat",
-    "repea",
-    "repeat ",
-    "fo",
-    "for",
-    "z\na",
-    "z\na ",
-    "\na",
-    "v w x y z",
-    "u v w x y z\n",
-    "go a",
-    "go a ",
-    "\ngo"
-]
+    "r s t u v",
+    "u v w x y z\naa",
+    "a b aax abx",
+    "a b aa",
+    "a b aax aa",
+    "abc def bax aax",
+] * 4
 assert ppo.batch_size <= len(prompts)
 
-model.train()
-policy_net.train()
-value_net.train()
-num_epochs = 200
+num_epochs = 155
 try:
     for epoch in range(num_epochs):
         trajectories = collect_trajectories(policy_net, value_net, prompts, epoch)
@@ -714,18 +656,9 @@ try:
 except KeyboardInterrupt:
     pass
 
-model.eval()
-policy_net.eval()
-value_net.eval()
-try:
-    for p in prompts:
-        print(generate(p, 35, temperature=1.0))
-except KeyboardInterrupt:
-    pass
+for p in prompts:
+    print(generate(p, 35, temperature=1.0))
 
-
-# Beam search doesn't directly sample the policy in the same way as the PPO training loop
-# so it's not directly comparable; the below method is more accurate.
 
 def generate_no_beam(policy_net, prompt,
                      max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS_AT_A_TIME,
@@ -758,7 +691,7 @@ def generate_no_beam(policy_net, prompt,
         relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
         logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
         
-        dist = Categorical(torch.nn.functional.log_softmax(logits=logits / temperature, dim=-1))
+        dist = Categorical(logits=logits / temperature)
         action = dist.sample()
         int_seq = true_seq + action.tolist()
         

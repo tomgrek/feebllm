@@ -7,15 +7,13 @@ import torch
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-torch.manual_seed(0)
-random.seed(0)
-
 PADDING_IDX = 0
 TOTAL_SEQUENCE_LENGTH = 20
 PREDICT_N_TOKENS_AT_A_TIME = 1
 MAX_VOCAB_SIZE = 29 # Must be <= number of tokens in the corpus
 BATCH_SIZE = 128  # Max, will use smaller batches sometimes
 TEMPERATURE = 1.5
+next_temp = TEMPERATURE
 
 corpus = """
 a b c d e f g h i j k l m n o p q r s t u v w x y z
@@ -193,6 +191,7 @@ class Model(torch.nn.Module):
         self.fc = torch.nn.Linear(embedding_dim, num_tokens)
         self.dropout = torch.nn.Dropout(0.1)
         self.layer_norm = torch.nn.LayerNorm(embedding_dim)
+        self.value_head = torch.nn.Linear(embedding_dim, 1)
 
     def forward(self, x, mask):
         seq_length = x.size(1)
@@ -207,8 +206,9 @@ class Model(torch.nn.Module):
         
         x = self.layer_norm(x)
         x = self.dropout(x)
-        x = self.fc(x)
-        return x
+        policy_logits = self.fc(x)
+        value = self.value_head(x)
+        return policy_logits, value
 
 def train(model, data, epochs=20, early_stop=-float("inf")):
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.002, weight_decay=0.01)
@@ -221,7 +221,7 @@ def train(model, data, epochs=20, early_stop=-float("inf")):
             mini_batch_size = BATCH_SIZE
         datas = [get_batch(data, bs=mini_batch_size) for _ in range(len(data) // BATCH_SIZE)]
         for seq, target, input_mask, output_mask in datas:
-            output = model(seq, input_mask)
+            output, _ = model(seq, input_mask)
             
             loss = torch.nn.functional.cross_entropy(output.permute(0, 2, 1), target, reduction='none')
             
@@ -244,7 +244,7 @@ examples = generate_data(10000, max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS
 model = Model(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)
 model.train()
 try:
-    train(model, examples, epochs=10000, early_stop=0.1)  # Harder to train PPO once it's overfit
+    train(model, examples, epochs=10000, early_stop=0.2)
 except KeyboardInterrupt:
     pass
 model.eval()
@@ -256,7 +256,7 @@ total_correct = 0
 
 for i in range(num_eval):
     seq, target, input_mask, output_mask = get_batch(eval_examples, bs=1)
-    output = model(seq, input_mask)
+    output, _ = model(seq, input_mask)
     output = output.squeeze(0)
     relevant_index = (output_mask == 1).nonzero(as_tuple=True)[1][0].item()
     
@@ -297,7 +297,7 @@ def generate(prompt, iterations=3,
             assert mask_tensor.view(-1)[-1] == 0
 
             with torch.no_grad():
-                output = model(seq_tensor, mask_tensor)
+                output, _ = model(seq_tensor, mask_tensor)
             output = output.squeeze(0)
             relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
             logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
@@ -323,7 +323,6 @@ print(generate("l m n o", 25))
 # print(generate("you peasant", 25))
 
 #############################################
-
 model.train()
 
 from torch.distributions import Categorical
@@ -334,112 +333,123 @@ class PolicyNetwork(torch.nn.Module):
         self.model = model
 
     def forward(self, x, mask):
-        logits = self.model(x, mask)
+        logits, _ = self.model(x, mask)
         return logits
 
 class ValueNetwork(torch.nn.Module):
-    def __init__(self, embedding_dim, num_tokens):
+    def __init__(self, model):
         super(ValueNetwork, self).__init__()
-        self.embedding = torch.nn.Embedding(num_tokens, embedding_dim)
-        self.fc1 = torch.nn.Linear(embedding_dim, 128)
-        self.fc2 = torch.nn.Linear(128, 1)
+        self.model = model
 
     def forward(self, x, mask):
-        x = self.embedding(x)
-        x = x.squeeze(2) * mask
-        x = torch.relu(self.fc1(x))
-        value = self.fc2(x)
+        _, value = self.model(x, mask)
         return value
 
 
 class PPO:
-    def __init__(self, policy_net, value_net, policy_lr=0.0001, value_lr=0.0001, gamma=0.99, clip_epsilon=0.2, update_epochs=10):
+    def __init__(self, policy_net, value_net, policy_lr=0.0001, value_lr=0.0001, gamma=0.99, clip_epsilon=0.2,
+                 update_epochs=10, batch_size=BATCH_SIZE):
         self.policy_net = policy_net
         self.value_net = value_net
-        self.policy_optimizer = torch.optim.Adam(policy_net.parameters(), lr=policy_lr)
-        self.value_optimizer = torch.optim.Adam(value_net.parameters(), lr=value_lr)
+        #self.policy_optimizer = torch.optim.Adam(policy_net.parameters(), lr=policy_lr)
+        ###### UGGHHHHH model.value_head.
+        #self.value_optimizer = torch.optim.Adam(value_net.parameters(), lr=value_lr)
+        # params = list(policy_net.parameters()) + list(value_net.parameters())
+        params = set(policy_net.parameters()).union(set(value_net.parameters()))
+        self.optimizer = torch.optim.Adam(params, lr=policy_lr)
         self.gamma = gamma
         self.clip_epsilon = clip_epsilon
         self.update_epochs = update_epochs
+        self.batch_size = batch_size
     
     def normalize(self, tensor):
-        tensor = torch.tensor(tensor, device=device)
+        # tensor = torch.tensor(tensor, device=device)
         mean = tensor.mean()
         std = tensor.std()
-        return ((tensor - mean) / (std + 1e-8)).tolist()
+        return ((tensor - mean) / (std + 1e-8))#.tolist()
 
     def compute_advantages(self, rewards, values, masks):
         advantages = []
         returns = []
-        # rewards2 = self.normalize(rewards) # This turns all the rewards negative except the last!
-        rewards2 = rewards
-        # import ipdb; ipdb.set_trace()
-        #advantage = torch.zeros_like(values[0], device=device)  # Initialize advantage with the same shape as values
-        return_ = torch.zeros_like(values[0], device=device)  # Initialize return_ with the same shape as values
-
-        # Initialize the last return with the last reward
-        #return_[-1] = rewards[-1]
-        returns.append(rewards2[-1])
-
+        # rewards = self.normalize(rewards)
+        return_ = torch.zeros_like(values[0], device=device)
+        
+        returns.append(rewards[-1])
+        # Initialize the last advantage with the last TD error
         advantages.append(values[-1] - return_)
+        # Previously I had advantages.append(rewards[-1] - values[-1])
 
-        for i in reversed(range(len(rewards2) - 1)):
-            return_ = rewards2[i] + self.gamma * returns[0]  # Compute the return for the current step
-            returns.insert(0, return_)
+        for i in reversed(range(len(rewards) - 1)):
+            return_ = rewards[i] + self.gamma * return_  # Compute the return for the current step
+            returns.insert(0, return_)  # Insert at the beginning of the list and detach
 
-            td_error = rewards2[i] + self.gamma * values[i + 1] - values[i]
+            td_error = rewards[i] + self.gamma * values[i + 1] - values[i]
             advantage = td_error + self.gamma * advantages[0]
             advantages.insert(0, advantage)
 
-        return advantages, returns
+        return torch.tensor(advantages, device=device), torch.tensor(returns, device=device)
+
+    def get_batch(self, trajectories):
+        batch = random.sample(trajectories, self.batch_size)
+        states, actions, rewards, masks, old_log_probs, values = zip(*batch)
+        batch_states = torch.cat(states, dim=0)
+        batch_actions = torch.cat(actions, dim=0)
+        batch_rewards = torch.tensor(rewards, device=device).reshape(self.batch_size, 1)
+        batch_masks = torch.cat(masks, dim=0)
+        batch_relevant_indices = [((mask == 1).nonzero(as_tuple=True)[1][-1].item() + 1) for mask in masks]
+        batch_relevant_indices = torch.tensor(batch_relevant_indices, device=device)
+        batch_old_log_probs = torch.cat(old_log_probs, dim=0)
+        batch_values = torch.cat(values, dim=0)
+        return batch_states, batch_actions, batch_rewards, batch_masks, batch_relevant_indices, batch_old_log_probs, batch_values
+
 
     def update(self, trajectories):
-        states, actions, rewards, masks, old_log_probs, values = trajectories
-        advantages, returns = self.compute_advantages(rewards, values, masks)
-
         for _ in range(self.update_epochs):
-            for state, action, mask, old_log_prob, advantage, return_ in zip(states, actions, masks, old_log_probs, advantages, returns):
-                logits = self.policy_net(state, mask)
-                
-                relevant_index = (mask == 1).nonzero(as_tuple=True)[1][-1].item() + 1
-                these_logits = logits[:, relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME, :]
-                dist = Categorical(logits=these_logits/TEMPERATURE)
-                #import ipdb; ipdb.set_trace()
-                log_prob = dist.log_prob(action).view_as(old_log_prob)
-                
-                ratio = torch.exp(log_prob - old_log_prob)
+            epoch_value_loss, epoch_policy_loss = 0.0, 0.0
+            for i in range(max(len(trajectories) // self.batch_size, 1)):
+                batch_states, batch_actions, batch_rewards, batch_masks, batch_relevant_indices, batch_old_log_probs, batch_values = self.get_batch(trajectories)
+                advantages, returns = self.compute_advantages(batch_rewards, batch_values, batch_masks)
 
-                surr1 = ratio * advantage
-                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantage
+                logits = self.policy_net(batch_states, batch_masks)
                 
+                these_logits = torch.gather(logits, 1, batch_relevant_indices.view(-1, 1, 1).expand(-1, -1, logits.size(-1)))  # correct
+                # TODO this breaks PREDICT_N_TOKENS_AT_A_TIME > 1
+                dist = Categorical(logits=these_logits / TEMPERATURE)
+
+                log_probs = dist.log_prob(batch_actions.view(self.batch_size, 1)).view_as(batch_old_log_probs)
+                ratio = torch.exp(log_probs - batch_old_log_probs)
+                surr1 = ratio * advantages
+                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
-
-                value = self.value_net(state, mask)
-                value = value.flatten().mean()#[:, -1, :]#.squeeze(2)
-
-                output_mask = mask.clone()
-                output_mask[:, relevant_index:relevant_index+PREDICT_N_TOKENS_AT_A_TIME, :] = 1
-
+                value = self.value_net(batch_states, batch_masks)
                 
-                valid_indices = output_mask.squeeze(2) == 1  # Get indices of valid (non-padding) tokens
-                value_loss = (return_ - value).pow(2).mean()#(return_[valid_indices] - value[valid_indices]).pow(2).mean()
-                #print(f"Return: {return_}, Predicted Value: {value} --- Value loss: {value_loss}")
+                
+                # This works but value is bs x seqlen x 1 while returns is bs x 1
+                # value_loss = (returns - value).pow(2).mean()
+                # This seems more correct but doesn't work
+                # value_loss = (returns - value.squeeze(-1).mean(-1)).pow(2).mean()
+                value_loss = (returns - value.squeeze(-1).mean(dim=-1)).pow(2).mean()
+                
+                #self.value_optimizer.zero_grad()
+                #value_loss.backward()
+                #self.value_optimizer.step()
+                #self.policy_optimizer.zero_grad()
+                self.optimizer.zero_grad()
+                #policy_loss.backward()
+                #self.policy_optimizer.step()
+                (policy_loss + value_loss).backward()
+                self.optimizer.step()
+                epoch_value_loss += value_loss.item()
+                epoch_policy_loss += policy_loss.item()
+            print(f"Policy loss: {epoch_policy_loss}, Value loss: {epoch_value_loss}")
 
-                self.policy_optimizer.zero_grad()
-                policy_loss.backward()
-                self.policy_optimizer.step()
-
-                self.value_optimizer.zero_grad()
-                value_loss.backward()
-                self.value_optimizer.step()
-            print(f"Policy loss: {policy_loss.item()}, Value loss: {value_loss.item()}")
 
 
 def collect_trajectories(policy_net, value_net, prompts,
                          max_len=TOTAL_SEQUENCE_LENGTH - PREDICT_N_TOKENS_AT_A_TIME,
                          total_length=TOTAL_SEQUENCE_LENGTH,
                          epsilon=-float("inf")):
-    global TEMPERATURE
+    global next_temp
     states = []
     actions = []
     rewards = []
@@ -448,6 +458,9 @@ def collect_trajectories(policy_net, value_net, prompts,
     values = []
 
     avg_reward = 0.0
+
+    TEMPERATURE = next_temp
+    print(f"Temperature: {TEMPERATURE}")
 
     for prompt in prompts:
         int_seq = tokenizer.tokenize(prompt) 
@@ -466,14 +479,15 @@ def collect_trajectories(policy_net, value_net, prompts,
             assert len(int_seq) == len(mask)
             assert mask_tensor.view(-1)[-1] == 0
 
-            output = policy_net(seq_tensor, mask_tensor)
+            with torch.no_grad():
+                output = policy_net(seq_tensor, mask_tensor)
+                value = value_net(seq_tensor, mask_tensor)
 
-            output = output.squeeze(0)  # This chops off the batch dimension??????????
+            output = output.detach().squeeze(0)  # This chops off the batch dimension??????????
             relevant_index = (mask_tensor == 1).nonzero(as_tuple=True)[1][-1].item() + 1
             logits = output[relevant_index:relevant_index + PREDICT_N_TOKENS_AT_A_TIME]
             
-            whitened_logits = logits / TEMPERATURE  # temperature > 1 makes it more uniform, < 1 makes it more peaky
-            dist = Categorical(logits=whitened_logits)
+            dist = Categorical(logits=logits / TEMPERATURE)
 
             if random.random() < epsilon:
                 action = torch.tensor([random.randint(0, logits.size(-1) - 1)], device=device)
@@ -487,56 +501,55 @@ def collect_trajectories(policy_net, value_net, prompts,
             int_seq = true_seq + action.tolist()
             
             actions.append(action)
-            log_probs.append(log_prob.detach())
-            with torch.no_grad():
-                value = value_net(seq_tensor, mask_tensor).detach()
-                values.append(value.flatten().mean())
+            log_probs.append(log_prob)
+
+            values.append(value.squeeze(-1).mean(dim=-1))
             iterations -= 1
             seq_text = tokenizer.decode(int_seq)
-            good_chars = seq_text.count("x") - prompt.count("x") #/ (TOTAL_SEQUENCE_LENGTH/2)
-            bad_chars = seq_text.count("d") + seq_text.count("b") #- prompt.count("a") - prompt.count("d") #/ TOTAL_SEQUENCE_LENGTH
+            good_chars = seq_text.count("a") + seq_text.count("b")
+            bad_chars = seq_text.count("e") - prompt.count("e")
+            all_chars = set(seq_text)
+            unique_chars = len(all_chars)
             if iterations == 0:
-                
-                
-                num_whitespaces = (seq_text.count(" ") + seq_text.count("\n")) #/ TOTAL_SEQUENCE_LENGTH
-                all_chars = set(seq_text)
-                unique_chars = len(all_chars) - len(set(prompt))
-                #reward = good_chars - (0.3*bad_chars) + (num_whitespaces / (0.5*TOTAL_SEQUENCE_LENGTH))
-                reward = (bad_chars * 4) - good_chars#num_whitespaces #22-
-
+                num_whitespaces = (seq_text.count(" ") + seq_text.count("\n"))
+                reward = (good_chars * 2) - bad_chars
                 print(f"---> Desired chars: {good_chars} vs whitespace: {num_whitespaces} vs unique chars: {unique_chars} ------ Reward: {reward}")
                 rewards.append(reward)
             else:
-                rewards.append(0.0)#((good_chars*2) - bad_chars) / 10)#0.0)#0.01 * int(good_chars > bad_chars))#rewards.append(0.0)
+
+                rewards.append(0.0)#(0.02*unique_chars)#0.01 * int(good_chars > bad_chars))#rewards.append(0.0)
             
             avg_reward += rewards[-1]
     avg_reward /= len(prompts)
     print(f"Average reward: {avg_reward}")
-    if avg_reward > 4.0:
-        newtemp = TEMPERATURE * 0.9
-    elif avg_reward < 2.0:
-        newtemp = TEMPERATURE * 1.1
+    if False:#avg_reward > 5:
+        next_temp = TEMPERATURE * 0.9
+    elif False:#avg_reward < 3:
+        next_temp = TEMPERATURE * 1.1
     else:
-        newtemp = TEMPERATURE
-    TEMPERATURE = max(0.9, min(4.0, newtemp))
-    print(f"Temperature: {TEMPERATURE}")
-
-    return states, actions, rewards, masks, log_probs, values
+        next_temp = TEMPERATURE
+    print(f"Next temperature should be: {next_temp}")
+    next_temp = max(0.9, min(4.0, next_temp))
+    print(f"Next temperature will be: {next_temp}")
+    
+    return [(x, y, z, a, b, c) for x, y, z, a, b, c in zip(states, actions, rewards, masks, log_probs, values)]
+    #return zip(states, actions, rewards, masks, log_probs, values)
 
 
 policy_net = PolicyNetwork(model).to(device)
-value_net = ValueNetwork(embedding_dim=64, num_tokens=MAX_VOCAB_SIZE).to(device)
+value_net = ValueNetwork(model).to(device)
 
-ppo = PPO(policy_net, value_net, update_epochs=10)
+# Initialize PPO
+ppo = PPO(policy_net, value_net, update_epochs=10, batch_size=12)
 
 prompts = [
     "a",
     "a b ",
-    # "a b",
-    # "ab",
-    # "b c d ",
-    # "b c d e ",
-    # "a b c d e",
+    "a b",
+    "ab",
+    "b c d ",
+    "b c d e ",
+    "a b c d e",
     # "c d e ",
     # "a b c d e ",
     # "a b c a b",
@@ -545,19 +558,19 @@ prompts = [
     # "f g h b c",
     # "l m n o p q r",
     # "l m nod d d",
-    # "d e f",
+    "d e f",
     "x y z",
     "w x y z",
     "r s t u v",
-    # "w x y z\na b c",
-    # "z\na b c d"
+    "w x y z\na b c",
+    "z\na b c d"
 ]
 
 num_epochs = 100
 num_steps = 2048
 try:
     for epoch in range(num_epochs):
-        trajectories = collect_trajectories(policy_net, value_net, prompts, num_steps)
+        trajectories = collect_trajectories(policy_net, value_net, prompts)
         ppo.update(trajectories)
         print(f"Epoch {epoch} completed")
 except KeyboardInterrupt:
